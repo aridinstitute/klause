@@ -1,0 +1,20 @@
+[package]
+name = "klause"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "TODO: one-sentence description of the Klause library."
+license = "MIT"
+repository = "https://github.com/aridinstitute/klause"
+readme = "README.md"
+
+# TODO: Add keywords (at most 5, each 20 characters or fewer) and categories
+# before publishing to crates.io. See <https://crates.io/category_slugs>.
+# keywords = [""]
+# categories = [""]
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]

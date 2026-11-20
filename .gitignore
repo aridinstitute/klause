@@ -20,3 +20,6 @@
 # OS files
 .DS_Store
 Thumbs.db
+
+# Library lockfile (reproducible builds are pinned by downstream users)
+/Cargo.lock

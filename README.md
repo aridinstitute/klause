@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/klause.svg)](https://crates.io/crates/klause)
 [![Docs.rs](https://docs.rs/klause/badge.svg)](https://docs.rs/klause)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
 <!-- TODO: One-line description of what Klause does and who it is for. -->
 A short, one-sentence description of the library.
@@ -54,7 +54,6 @@ For more examples, see the [`examples/`](./examples) directory and the
 | Feature | Default | Description |
 | ------- | ------- | ----------- |
 | `std`   | yes     | Enables the standard library. Disable for `no_std` support. |
-| `serde` | no      | Implements `Serialize` and `Deserialize` for public types. |
 
 ## Minimum supported Rust version (MSRV)
 
@@ -73,17 +72,9 @@ cargo test --all-features
 ```
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
-be dual licensed as below, without any additional terms or conditions.
+for inclusion in this crate by you shall be licensed under the MIT license,
+without any additional terms or conditions.
 
 ## License
 
-Licensed under either of
-
-- [Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0)
-- [MIT license](http://opensource.org/licenses/MIT)
-
-at your option.
-
-<!-- TODO: Add LICENSE-APACHE and LICENSE-MIT files, or update this section to
-     match the license you choose. -->
+This project is licensed under the [MIT License](LICENSE).
