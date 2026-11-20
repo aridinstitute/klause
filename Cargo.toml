@@ -8,6 +8,10 @@ license = "MIT"
 repository = "https://github.com/aridinstitute/klause"
 readme = "README.md"
 
+# The examples/ directory holds API sketches that don't compile yet, so cargo
+# must not try to build them as example targets.
+autoexamples = false
+
 # TODO: Add keywords (at most 5, each 20 characters or fewer) and categories
 # before publishing to crates.io. See <https://crates.io/category_slugs>.
 # keywords = [""]
