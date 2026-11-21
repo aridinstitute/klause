@@ -4,18 +4,29 @@
 [![Docs.rs](https://docs.rs/klause/badge.svg)](https://docs.rs/klause)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
-<!-- TODO: One-line description of what Klause does and who it is for. -->
-A short, one-sentence description of the library.
+Klause is a document data model designed for efficient text extraction, annotation, and searching.
 
 ## Overview
 
-<!-- TODO: Explain the problem Klause solves, its main ideas, and when to use it. -->
-Klause is a Rust library that _does something useful_. It is designed to be
-small, fast, and easy to embed in other projects.
+Klause is a Rust library that makes working with annotated documents easy. The API is designed to be
+easy to learn and use, and the data model is very flexible, allowing annotation and querying of documents
+such as ancient texts, the Bible, and more.
 
-- **Feature one** — what makes it valuable.
-- **Feature two** — what makes it valuable.
-- **Feature three** — what makes it valuable.
+- **Flexible Data Model** — Text is annotated by spans and attributes, allowing lots of flexibility in data storage.
+- **Plain-Text Model** — Plain, unannotated text is stored as its own property, allowing tradition text querying using tools like regex.
+- **Speed** — Klause is designed to filter and aggregate as fast as possible.
+
+## Definitions
+
+- **Document** — An ID, attributes, and a text that only ever grows, plus the stored layers of spans annotated on it.
+- **Span** — One annotation in a layer: a target (text ranges, a point, another span, or a link), attributes, and an ID.
+- **Layer** — A named set of spans. Stored layers live in the document; source layers are read live from your own storage.
+- **Value** — An attribute value: null, bool, integer, float, string, or a list of those.
+- **Selection** — A sorted set of text ranges that can be unioned, intersected, and subtracted.
+- **Passage** — A range of text with every span that touches it, ready to render.
+- **Query** — A fluent builder that filters text and returns a selection, passages, spans, or counts.
+- **Corpus** — Several documents, for queries across them, links between them, and layers they share.
+- **Anchor** — A checksum, quote, and surrounding context that finds a stored span again in a new edition.
 
 ## Installation
 
@@ -34,9 +45,8 @@ cargo add klause
 
 ## Usage
 
-<!-- TODO: Replace with a real, runnable example. -->
 ```rust
-use klause::Klause;
+use klause::Document;
 
 fn main() {
     let klause = Klause::new();
@@ -47,33 +57,13 @@ fn main() {
 For more examples, see the [`examples/`](./examples) directory and the
 [API documentation](https://docs.rs/klause).
 
-## Feature flags
-
-<!-- TODO: Document or remove this section if the crate has no optional features. -->
-
-| Feature | Default | Description |
-| ------- | ------- | ----------- |
-| `std`   | yes     | Enables the standard library. Disable for `no_std` support. |
-
 ## Minimum supported Rust version (MSRV)
 
-<!-- TODO: Set the MSRV and keep it in sync with rust-version in Cargo.toml. -->
 Klause requires Rust 1.85 or newer.
 
 ## Contributing
 
-Contributions are welcome! Please open an issue to discuss a change before
-submitting a pull request, and make sure the following pass locally:
-
-```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-```
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this crate by you shall be licensed under the MIT license,
-without any additional terms or conditions.
+I'm not currently accepting contributions, but feel free to make an issue if you want a feature or find a bug!
 
 ## License
 
