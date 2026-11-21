@@ -8,8 +8,7 @@ license = "MIT"
 repository = "https://github.com/aridinstitute/klause"
 readme = "README.md"
 
-# The examples/ and tests/ directories hold API sketches that don't compile
-# yet, so cargo must not build them as targets.
+# Opt in to targets as the API sketches are turned into compiling code.
 autoexamples = false
 autotests = false
 
@@ -23,3 +22,31 @@ default = ["std"]
 std = []
 
 [dependencies]
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[test]]
+name = "document"
+
+[[test]]
+name = "annotating"
+
+[[test]]
+name = "selecting"
+
+[[test]]
+name = "passages"
+
+[[test]]
+name = "querying"
+
+[[test]]
+name = "sources"
+
+[[test]]
+name = "bible"
+
+[[bench]]
+name = "document_creation"
+harness = false
