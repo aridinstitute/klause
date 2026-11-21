@@ -22,6 +22,7 @@ default = ["std"]
 std = []
 
 [dependencies]
+unicode-normalization = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }
