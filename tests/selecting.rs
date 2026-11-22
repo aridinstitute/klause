@@ -1,9 +1,7 @@
 mod common;
 
 use common::{GENESIS, at, genesis, verse};
-use klause::{
-    Document, Selection, Span, SpanFilter, any_of, select_all_spans, select_span, select_spans,
-};
+use klause::{Document, Selection, Span, SpanFilter, all_spans, any_of, span_id, spans_in};
 
 /// Two analyses of the same word, a second word, an alternative layer, and reviews of the analyses.
 fn analyses() -> Document {
@@ -49,7 +47,7 @@ fn every_condition_of_a_filter_must_hold_on_the_same_span() {
     let doc = analyses();
 
     // "a" is a noun and "b" has H3, on the same text, but no one span has both.
-    let filter = select_spans("morph")
+    let filter = spans_in("morph")
         .with_attr("pos", "noun")
         .with_attr("strongs", "H3");
     assert_eq!(count(&doc, filter.clone()), 0);
@@ -58,7 +56,7 @@ fn every_condition_of_a_filter_must_hold_on_the_same_span() {
     assert_eq!(
         count(
             &doc,
-            select_spans("morph")
+            spans_in("morph")
                 .with_attr("pos", "noun")
                 .with_attr("strongs", "H2")
         ),
@@ -71,24 +69,21 @@ fn attribute_conditions_look_at_every_value_of_a_key() {
     let doc = analyses();
 
     // "a" matches on its second value.
-    assert_eq!(
-        count(&doc, select_spans("morph").with_attr("strongs", "H2")),
-        1
-    );
+    assert_eq!(count(&doc, spans_in("morph").with_attr("strongs", "H2")), 1);
     // "a" has H1, but also H2, so it is excluded; "c" has no strongs at all, so it is kept.
     assert_eq!(
-        count(&doc, select_spans("morph").without_attr("strongs", "H2")),
+        count(&doc, spans_in("morph").without_attr("strongs", "H2")),
         2
     );
     assert_eq!(
         count(
             &doc,
-            select_spans("morph").with_attr("strongs", any_of(["H3", "H9"]))
+            spans_in("morph").with_attr("strongs", any_of(["H3", "H9"]))
         ),
         1
     );
-    assert_eq!(count(&doc, select_spans("morph").with_key("strongs")), 2);
-    assert_eq!(count(&doc, select_spans("morph").without_key("strongs")), 1);
+    assert_eq!(count(&doc, spans_in("morph").with_key("strongs")), 2);
+    assert_eq!(count(&doc, spans_in("morph").without_key("strongs")), 1);
 }
 
 #[test]
@@ -97,23 +92,23 @@ fn numeric_conditions_compare_numbers_by_value() {
     let verses = |filter: SpanFilter| doc.get_selection(filter).unwrap().ranges().to_vec();
 
     assert_eq!(
-        verses(select_spans("verses").with_attr("number", 2.0)),
+        verses(spans_in("verses").with_attr("number", 2.0)),
         [verse(2)]
     );
     assert_eq!(
-        verses(select_spans("verses").with_attr("number", 2..)),
+        verses(spans_in("verses").with_attr("number", 2..)),
         [verse(2)]
     );
     assert_eq!(
-        verses(select_spans("verses").with_attr("number", 1..2)),
+        verses(spans_in("verses").with_attr("number", 1..2)),
         [verse(1)]
     );
     assert_eq!(
-        verses(select_spans("verses").with_attr("number", 0.5..1.5)),
+        verses(spans_in("verses").with_attr("number", 0.5..1.5)),
         [verse(1)]
     );
     assert_eq!(
-        verses(select_spans("verses").with_attr("number", any_of([2, 3]))),
+        verses(spans_in("verses").with_attr("number", any_of([2, 3]))),
         [verse(2)]
     );
 }
@@ -123,27 +118,27 @@ fn selectors_resolve_to_the_ranges_of_the_spans_they_name() {
     let doc = genesis();
 
     assert_eq!(
-        doc.get_selection(select_span("verses", "GEN 1:2"))
+        doc.get_selection(span_id("verses", "GEN 1:2"))
             .unwrap()
             .ranges(),
         [verse(2)]
     );
     assert_eq!(
-        doc.get_selection(select_spans("verses").with_id("GEN 1:1"))
+        doc.get_selection(spans_in("verses").with_id("GEN 1:1"))
             .unwrap()
             .ranges(),
         [verse(1)]
     );
     // Morphology targets words, so it selects the words' text.
     assert_eq!(
-        doc.get_selection(select_spans("morph").with_attr("pos", "verb"))
+        doc.get_selection(spans_in("morph").with_attr("pos", "verb"))
             .unwrap()
             .ranges(),
         [at("created", 0), at("was", 0)]
     );
     // Consecutive verses meet and merge into one range.
     assert_eq!(
-        doc.get_selection(select_spans("verses")).unwrap().ranges(),
+        doc.get_selection(spans_in("verses")).unwrap().ranges(),
         [0..GENESIS.len() as u32]
     );
 }
@@ -153,7 +148,7 @@ fn filters_can_span_every_layer_or_match_through_targets() {
     let doc = analyses();
 
     assert_eq!(
-        doc.get_selection(select_all_spans().with_attr("pos", "noun"))
+        doc.get_selection(all_spans().with_attr("pos", "noun"))
             .unwrap()
             .ranges(),
         [0..3, 4..7, 8..11]
@@ -161,16 +156,14 @@ fn filters_can_span_every_layer_or_match_through_targets() {
     assert_eq!(
         count(
             &doc,
-            select_spans("review").targeting(select_spans("morph").with_attr("pos", "verb"))
+            spans_in("review").targeting(spans_in("morph").with_attr("pos", "verb"))
         ),
         1
     );
     assert_eq!(
-        doc.get_selection(
-            select_spans("review").targeting(select_spans("morph").with_attr("pos", "noun"))
-        )
-        .unwrap()
-        .ranges(),
+        doc.get_selection(spans_in("review").targeting(spans_in("morph").with_attr("pos", "noun")))
+            .unwrap()
+            .ranges(),
         [4..7]
     );
 }

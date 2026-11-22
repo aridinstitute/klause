@@ -47,8 +47,9 @@ The API is fluent: values are built by chaining methods, and chains read as sent
 - **Builders** never fail. `with_*` adds, `set_*` replaces, and `remove_*` removes:
   `Span::from(0..3).with_id(1).with_attr("pos", "noun")`. `Document`, `Layer`, `Span`, `SpanFilter`, and `Query`
   are all built this way.
-- **Selectors are a verb and a noun**: `select_spans("morph")`, `select_all_spans()`, `select_span("verses",
-  "GEN 3:15")`. They describe text for a query step or passage to read, and are resolved when it runs.
+- **Span selectors name their result**: `spans_in("morph")` and `all_spans()` create span filters;
+  `span_id("verses", "GEN 3:15")` creates a reference to one span. They describe text for a query step or
+  passage to read, and are resolved when it runs.
 - **Query steps say how they change the hits**: `within`, `outside`, `in_layer`, `in_span`, `with_text`,
   `followed_by`, `expand_to`. Their errors surface from the final verb.
 - **Methods that can fail with an `Error` start with a verb**: `push`, `add_span`, `get_passage`, `get_selection`.
@@ -270,26 +271,26 @@ Layer IDs are any non-empty string, and `&str` converts to `Layer::new(id)`.
 Query steps and passages read text described by an `impl IntoSelection`. Selectors build one fluently:
 
 ```rust
-use klause::{select_spans, select_all_spans, select_span, any_of};
+use klause::{spans_in, all_spans, span_id, any_of};
 
-select_span("verses", "GEN 3:15")                               // one span's ranges
-select_spans("verses")                                          // every span in a layer
-select_spans("morph").with_attr("pos", "verb")                  // has this value
-select_spans("morph").with_attr("pos", any_of(["noun", "pn"]))  // has one of these values
-select_spans("morph").with_attr("number", 2..)                  // has a number in this range
-select_spans("morph").without_attr("stem", "qal")               // has no value equal to this
-select_spans("morph").with_key("lemma")                         // has the key
-select_spans("morph").without_key("gloss")                      // doesn't have the key
-select_spans("verses").with_id("GEN 3:15")
-select_spans("review").targeting(select_spans("morph").with_attr("pos", "verb"))   // its target matches
-select_all_spans().with_attr("speaker", "Jesus")                // spans in any layer
+span_id("verses", "GEN 3:15")                               // one span's ranges
+spans_in("verses")                                          // every span in a layer
+spans_in("morph").with_attr("pos", "verb")                  // has this value
+spans_in("morph").with_attr("pos", any_of(["noun", "pn"]))  // has one of these values
+spans_in("morph").with_attr("number", 2..)                  // has a number in this range
+spans_in("morph").without_attr("stem", "qal")               // has no value equal to this
+spans_in("morph").with_key("lemma")                         // has the key
+spans_in("morph").without_key("gloss")                      // doesn't have the key
+spans_in("verses").with_id("GEN 3:15")
+spans_in("review").targeting(spans_in("morph").with_attr("pos", "verb"))   // its target matches
+all_spans().with_attr("speaker", "Jesus")                // spans in any layer
 ```
 
-- `select_span` returns a `SpanRef`. `select_spans` and `select_all_spans` return a `SpanFilter`; every condition in
+- `span_id` returns a `SpanRef`. `spans_in` and `all_spans` return a `SpanFilter`; every condition in
   one filter must hold on the same span, and the selection is the union of the matching spans' ranges.
 - Ranges (`0..47`, `..`, arrays and `Vec`s of ranges) and `Selection` are accepted as they are.
 - Steps and verbs that take a filter, such as `expand_to` and `get_spans`, also accept a layer ID: `"verses"` means
-  `select_spans("verses")`.
+  `spans_in("verses")`.
 
 `IntoSelection` converts its input against a document:
 
@@ -322,7 +323,7 @@ between the start and end of a range on the other side.
 
 ```rust
 let p  = doc.get_passage(0..47)?;                              // a range
-let p  = doc.get_passage(select_span("verses", "GEN 3:15"))?;  // a span's text
+let p  = doc.get_passage(span_id("verses", "GEN 3:15"))?;  // a span's text
 let p  = doc.get_passage(..)?;                                 // the whole document
 let ps = doc.get_passages([0..3, 42..47])?;                    // Vec<Passage>, one per range
 
@@ -364,12 +365,12 @@ Adding `p.range().start` to a local position gives the document position.
 back.
 
 ```rust
-use klause::{select_spans, Distance};
+use klause::{spans_in, Distance};
 
 // Verses with a construct noun directly followed by a proper noun.
 doc.find()
-    .within(select_spans("morph").with_attr("pos", "noun").with_attr("state", "cstr"))
-    .followed_by(select_spans("morph").with_attr("pos", "pn"), Distance::adjacent())
+    .within(spans_in("morph").with_attr("pos", "noun").with_attr("state", "cstr"))
+    .followed_by(spans_in("morph").with_attr("pos", "pn"), Distance::adjacent())
     .get_spans("verses")?;
 ```
 
@@ -379,8 +380,8 @@ doc.find()
 | :------------------------ | :--------------------------------------------------------------------------------------- |
 | `.within(x)`              | The parts of the hits inside `x`'s selection.                                            |
 | `.outside(x)`             | The parts of the hits not inside `x`'s selection.                                        |
-| `.in_layer(id)`           | `.within(select_spans(id))`: the parts of the hits inside any span of the layer.         |
-| `.in_span(layer, id)`     | `.within(select_span(layer, id))`: the parts of the hits inside that span.               |
+| `.in_layer(id)`           | `.within(spans_in(id))`: the parts of the hits inside any span of the layer.         |
+| `.in_span(layer, id)`     | `.within(span_id(layer, id))`: the parts of the hits inside that span.               |
 | `.with_text(t)`           | Every occurrence of the string `t` that lies wholly inside one hit range.                |
 | `.with_text_folded(t)`    | The same, comparing case-insensitively and ignoring combining marks.                     |
 | `.followed_by(f, d)`      | The hit ranges that have a range of a span matching `f` starting after them within `d`.  |
@@ -545,9 +546,9 @@ bible.add_span("xrefs", Span::on("verses", "GEN 3:15").with_attr("to", "ROM 16:2
 ### Reading a verse for display
 
 ```rust
-use klause::select_span;
+use klause::span_id;
 
-let p = bible.get_passage(select_span("verses", "GEN 3:15"))?;
+let p = bible.get_passage(span_id("verses", "GEN 3:15"))?;
 
 for line in p.spans_in("structure") {
     line.text();                      // ["And I will put enmity between you and the woman"]
@@ -567,13 +568,13 @@ bible.find().in_span("verses", "GEN 3:15").with_layers(["structure"]).get_passag
 ### Searching and counting
 
 ```rust
-use klause::{select_spans, Distance};
+use klause::{spans_in, Distance};
 
 // Verses that use a word.
-bible.find().within(select_spans("morph").with_attr("strongs", "H342")).get_spans("verses")?;
+bible.find().within(spans_in("morph").with_attr("strongs", "H342")).get_spans("verses")?;
 
 // Verses that cross-reference Romans 16:20: the reverse direction of `xrefs`.
-bible.find().within(select_spans("xrefs").with_attr("to", "ROM 16:20")).get_spans("verses")?;
+bible.find().within(spans_in("xrefs").with_attr("to", "ROM 16:20")).get_spans("verses")?;
 
 // A phrase, ignoring case, within one book.
 bible.find().in_span("books", "GEN").with_text_folded("seed of the woman").get_passages()?;
@@ -583,20 +584,20 @@ bible.find().in_span("chapters", "GEN 3").count_values("morph", "strongs")?;
 
 // Nouns directly followed by a verb, anywhere.
 bible.find()
-    .within(select_spans("morph").with_attr("pos", "noun"))
-    .followed_by(select_spans("morph").with_attr("pos", "verb"), Distance::adjacent())
+    .within(spans_in("morph").with_attr("pos", "noun"))
+    .followed_by(spans_in("morph").with_attr("pos", "verb"), Distance::adjacent())
     .count()?;
 ```
 
 ### Highlights from a database
 
 ```rust
-use klause::{Layer, select_span};
+use klause::{Layer, span_id};
 
 bible.add_layer(Layer::source("highlights", Highlights { db: db.clone() }))?;
 
 // The user selects `local`, a range of `p.text()` on screen.
-let p = bible.get_passage(select_span("verses", "GEN 3:15"))?;
+let p = bible.get_passage(span_id("verses", "GEN 3:15"))?;
 let start = p.range().start;
 let whole_words = bible.find()
     .within(local.start + start..local.end + start)
@@ -604,7 +605,7 @@ let whole_words = bible.find()
     .get_selection()?;
 db.save_highlight(whole_words.ranges(), "yellow")?;
 
-bible.get_passage(select_span("verses", "GEN 3:15"))?.spans_in("highlights");   // includes it
+bible.get_passage(span_id("verses", "GEN 3:15"))?.spans_in("highlights");   // includes it
 
 // Everything the user highlighted in Genesis, as whole verses.
 bible.find().in_span("books", "GEN").in_layer("highlights").expand_to("verses").get_passages()?;
@@ -652,7 +653,7 @@ current laptop:
 | :--------------------------------------------------------------------- | :-------- |
 | Building the document from rows in memory, through its first query     | < 1 s     |
 | `get_passage` of one chapter with every layer                          | < 1 ms    |
-| `within(select_spans("morph").with_attr("pos", "verb"))` over the Bible | < 20 ms   |
+| `within(spans_in("morph").with_attr("pos", "verb"))` over the Bible | < 20 ms   |
 | `count_values("morph", "strongs")` over the Bible                      | < 50 ms   |
 | Reverse cross-reference lookup for one verse                           | < 1 ms    |
 | `with_text_folded` of a three-word phrase over the Bible               | < 30 ms   |

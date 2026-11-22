@@ -28,7 +28,6 @@ pub use layer::Layer;
 pub use passage::{Passage, PassageSpan};
 pub use query::{Distance, Query};
 pub use selection::{
-    AnyOf, IntoSelection, Selection, SpanFilter, ValueMatcher, any_of, select_all_spans,
-    select_span, select_spans,
+    AnyOf, IntoSelection, Selection, SpanFilter, ValueMatcher, all_spans, any_of, span_id, spans_in,
 };
 pub use source::{SourceError, SpanSource};

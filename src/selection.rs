@@ -1,13 +1,16 @@
-use alloc::{string::String, vec::Vec};
-use core::ops::{Range, RangeFrom, RangeFull};
+use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+use core::{
+    fmt,
+    ops::{Range, RangeFrom, RangeFull},
+};
 
-use crate::document::{Document, Error, SpanId, SpanRef, Value};
+use crate::document::{Document, Error, Span, SpanId, SpanRef, Target, Value};
 
 /// A set of text ranges in a document, represented as sorted, non-overlapping byte ranges.
 /// Unlike a [`crate::Span`], a selection describes text positions and has no annotation attributes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selection {
-    _private: (),
+    ranges: Vec<Range<u32>>,
 }
 
 impl Selection {
@@ -24,7 +27,7 @@ impl Selection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn ranges(&self) -> &[Range<u32>] {
-        todo!()
+        &self.ranges
     }
 
     /// Returns a selection containing ranges from either selection.
@@ -41,7 +44,9 @@ impl Selection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn union(&self, _other: &Selection) -> Selection {
-        todo!()
+        let mut ranges = self.ranges.clone();
+        ranges.extend(_other.ranges.iter().cloned());
+        Self::from_ranges(ranges)
     }
 
     /// Returns the text covered by both selections.
@@ -58,7 +63,42 @@ impl Selection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn intersect(&self, _other: &Selection) -> Selection {
-        todo!()
+        let mut ranges = Vec::new();
+
+        for left in self.ranges.iter().filter(|range| range.start < range.end) {
+            for right in _other.ranges.iter().filter(|range| range.start < range.end) {
+                let start = left.start.max(right.start);
+                let end = left.end.min(right.end);
+                if start < end {
+                    ranges.push(start..end);
+                }
+            }
+        }
+
+        for point in self.ranges.iter().filter(|range| range.start == range.end) {
+            if _other
+                .ranges
+                .iter()
+                .any(|range| contains_point(range, point.start))
+            {
+                ranges.push(point.clone());
+            }
+        }
+        for point in _other
+            .ranges
+            .iter()
+            .filter(|range| range.start == range.end)
+        {
+            if self
+                .ranges
+                .iter()
+                .any(|range| contains_point(range, point.start))
+            {
+                ranges.push(point.clone());
+            }
+        }
+
+        Self::from_ranges(ranges)
     }
 
     /// Returns the portions of this selection not covered by `other`.
@@ -75,7 +115,42 @@ impl Selection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn subtract(&self, _other: &Selection) -> Selection {
-        todo!()
+        let mut ranges = Vec::new();
+        for range in self.ranges.iter().filter(|range| range.start < range.end) {
+            let mut pieces = vec![range.clone()];
+            for subtract in _other.ranges.iter().filter(|range| range.start < range.end) {
+                let mut next = Vec::new();
+                for piece in pieces {
+                    if subtract.end <= piece.start || subtract.start >= piece.end {
+                        next.push(piece);
+                    } else {
+                        if piece.start < subtract.start {
+                            next.push(piece.start..subtract.start);
+                        }
+                        if subtract.end < piece.end {
+                            next.push(subtract.end..piece.end);
+                        }
+                    }
+                }
+                pieces = next;
+                if pieces.is_empty() {
+                    break;
+                }
+            }
+            ranges.extend(pieces);
+        }
+
+        for point in self.ranges.iter().filter(|range| range.start == range.end) {
+            if !_other
+                .ranges
+                .iter()
+                .any(|range| contains_point(range, point.start))
+            {
+                ranges.push(point.clone());
+            }
+        }
+
+        Self::from_ranges(ranges)
     }
 
     /// Returns whether the byte position is selected, either by a range or as a point.
@@ -92,7 +167,13 @@ impl Selection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn contains(&self, _position: u32) -> bool {
-        todo!()
+        self.ranges.iter().any(|range| {
+            if range.start == range.end {
+                range.start == _position
+            } else {
+                range.start <= _position && _position < range.end
+            }
+        })
     }
 
     /// Returns whether this selection contains no ranges.
@@ -108,7 +189,53 @@ impl Selection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.ranges.is_empty()
+    }
+
+    pub(crate) fn from_ranges(ranges: Vec<Range<u32>>) -> Self {
+        let mut non_empty = Vec::new();
+        let mut points = Vec::new();
+        for range in ranges {
+            if range.start < range.end {
+                non_empty.push(range);
+            } else if range.start == range.end {
+                points.push(range.start);
+            }
+        }
+        non_empty.sort_by_key(|range| (range.start, range.end));
+
+        let mut merged: Vec<Range<u32>> = Vec::with_capacity(non_empty.len());
+        for range in non_empty {
+            if let Some(last) = merged.last_mut()
+                && range.start <= last.end
+            {
+                last.end = last.end.max(range.end);
+            } else {
+                merged.push(range);
+            }
+        }
+
+        points.sort_unstable();
+        points.dedup();
+        let mut ranges = merged.clone();
+        for point in points {
+            if !merged
+                .iter()
+                .any(|range| range.start <= point && point <= range.end)
+            {
+                ranges.push(point..point);
+            }
+        }
+        ranges.sort_by_key(|range| (range.start, range.end));
+        Self { ranges }
+    }
+}
+
+fn contains_point(range: &Range<u32>, point: u32) -> bool {
+    if range.start == range.end {
+        range.start == point
+    } else {
+        range.start <= point && point <= range.end
     }
 }
 
@@ -119,48 +246,144 @@ pub trait IntoSelection {
     /// # Example
     ///
     /// ```no_run
-    /// # use klause::{Document, IntoSelection, Span, select_span};
+    /// # use klause::{Document, IntoSelection, Span, span_id};
     /// # let mut doc = Document::new("GEN 3:15");
     /// # let range = doc.push("And I will put enmity")?;
     /// # doc.add_layer("verses")?;
     /// # let verse = doc.add_span("verses", Span::from(range.clone()).with_id("GEN 3:15"))?;
-    /// let reference = select_span("verses", "GEN 3:15");
+    /// let reference = span_id("verses", "GEN 3:15");
     /// let selection = reference.into_selection(&doc)?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     fn into_selection(self, doc: &Document) -> Result<Selection, Error>;
 }
 
-macro_rules! into_selection {
-    ($($source:ty),*) => {$(
-        impl IntoSelection for $source {
-            fn into_selection(self, _doc: &Document) -> Result<Selection, Error> {
-                todo!()
-            }
-        }
-    )*};
+impl IntoSelection for Range<u32> {
+    fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
+        doc.selection_from_ranges(vec![self])
+    }
 }
 
-into_selection!(
-    Range<u32>,
-    RangeFull,
-    Vec<Range<u32>>,
-    Selection,
-    &Selection,
-    SpanRef,
-    SpanFilter
-);
+impl IntoSelection for RangeFull {
+    fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
+        doc.selection_from_ranges(core::iter::once(0..doc.len()).collect())
+    }
+}
+
+impl IntoSelection for Vec<Range<u32>> {
+    fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
+        doc.selection_from_ranges(self)
+    }
+}
+
+impl IntoSelection for Selection {
+    fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
+        doc.selection_from_ranges(self.ranges)
+    }
+}
+
+impl IntoSelection for &Selection {
+    fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
+        doc.selection_from_ranges(self.ranges.clone())
+    }
+}
+
+impl IntoSelection for SpanRef {
+    fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
+        let ranges = doc
+            .ranges(&self)
+            .ok_or_else(|| Error::UnknownSpan(self.clone()))?;
+        doc.selection_from_ranges(ranges.to_vec())
+    }
+}
+
+impl IntoSelection for SpanFilter {
+    fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
+        doc.selection_for_filter(&self)
+    }
+}
 
 impl<const N: usize> IntoSelection for [Range<u32>; N] {
-    fn into_selection(self, _doc: &Document) -> Result<Selection, Error> {
-        todo!()
+    fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
+        doc.selection_from_ranges(Vec::from(self))
     }
 }
 
 /// Criteria for matching spans, such as spans in `morph` whose `pos` is `verb`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SpanFilter {
-    _private: (),
+    layers: Option<Vec<String>>,
+    conditions: Vec<Condition>,
+}
+
+#[derive(Clone)]
+enum Condition {
+    WithAttr(
+        String,
+        Arc<dyn Fn(&Value) -> bool + Send + Sync + 'static>,
+        Option<Value>,
+    ),
+    WithoutAttr(String, Value),
+    WithKey(String),
+    WithoutKey(String),
+    WithId(SpanId),
+    Targeting(Box<SpanFilter>),
+}
+
+impl fmt::Debug for SpanFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpanFilter")
+            .field("layers", &self.layers)
+            .field("conditions", &self.conditions.len())
+            .finish()
+    }
+}
+
+impl SpanFilter {
+    fn in_layers(layers: Option<Vec<String>>) -> Self {
+        Self {
+            layers,
+            conditions: Vec::new(),
+        }
+    }
+
+    pub(crate) fn layer_ids(&self) -> Option<&[String]> {
+        self.layers.as_deref()
+    }
+
+    pub(crate) fn index_hint(&self) -> Option<(&str, &Value)> {
+        self.conditions
+            .iter()
+            .find_map(|condition| match condition {
+                Condition::WithAttr(key, _, Some(value)) => Some((key.as_str(), value)),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn matches(&self, doc: &Document, span: &Span, layer_id: &str) -> bool {
+        if self
+            .layers
+            .as_ref()
+            .is_some_and(|layers| !layers.iter().any(|layer| layer == layer_id))
+        {
+            return false;
+        }
+        self.conditions.iter().all(|condition| match condition {
+            Condition::WithAttr(key, matcher, _) => span.values(key).any(|value| matcher(value)),
+            Condition::WithoutAttr(key, excluded) => {
+                !span.values(key).any(|value| value == excluded)
+            }
+            Condition::WithKey(key) => span.attrs().any(|(stored, _)| stored == key),
+            Condition::WithoutKey(key) => !span.attrs().any(|(stored, _)| stored == key),
+            Condition::WithId(id) => span.id() == Some(id),
+            Condition::Targeting(target_filter) => match span.target() {
+                Target::Span(reference) => doc
+                    .span(reference)
+                    .is_some_and(|target| target_filter.matches(doc, target, reference.layer())),
+                Target::Text(_) => false,
+            },
+        })
+    }
 }
 
 impl SpanFilter {
@@ -169,20 +392,31 @@ impl SpanFilter {
     /// # Example
     ///
     /// ```no_run
-    /// # use klause::{Document, Span, select_spans};
+    /// # use klause::{Document, Span, spans_in};
     /// # let mut doc = Document::new("GEN 3:15");
     /// # let range = doc.push("And I will put enmity")?;
     /// # doc.add_layer("words")?;
     /// # doc.add_span("words", Span::from(11..14).with_id("put"))?;
     /// # doc.add_span("words", Span::from(15..21).with_id("enmity").with_attr("pos", "noun"))?;
-    /// let nouns = select_spans("words").with_attr("pos", "noun");
-    /// let verbs = select_spans("words").with_attr("pos", "verb");
+    /// let nouns = spans_in("words").with_attr("pos", "noun");
+    /// let verbs = spans_in("words").with_attr("pos", "verb");
     /// assert_eq!(doc.get_selection(nouns)?.ranges(), &[15..21]); // “enmity”
     /// assert!(doc.get_selection(verbs)?.is_empty()); // No verb is tagged.
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn with_attr(self, _key: impl Into<String>, _matcher: impl ValueMatcher) -> Self {
-        todo!()
+    pub fn with_attr<M: ValueMatcher + 'static>(
+        mut self,
+        key: impl Into<String>,
+        matcher: M,
+    ) -> Self {
+        let index_hint = matcher.index_value();
+        let matcher = Arc::new(matcher);
+        self.conditions.push(Condition::WithAttr(
+            key.into(),
+            Arc::new(move |value| matcher.matches(value)),
+            index_hint,
+        ));
+        self
     }
 
     /// Excludes spans having the specified attribute value.
@@ -190,18 +424,20 @@ impl SpanFilter {
     /// # Example
     ///
     /// ```no_run
-    /// # use klause::{Document, Span, select_spans};
+    /// # use klause::{Document, Span, spans_in};
     /// # let mut doc = Document::new("GEN 3:15");
     /// # let range = doc.push("And I will put enmity")?;
     /// # doc.add_layer("words")?;
     /// # doc.add_span("words", Span::from(11..14).with_id("put"))?;
     /// # doc.add_span("words", Span::from(15..21).with_id("enmity").with_attr("pos", "noun"))?;
-    /// let non_verbs = select_spans("words").without_attr("pos", "verb");
+    /// let non_verbs = spans_in("words").without_attr("pos", "verb");
     /// let hits = doc.get_selection(non_verbs)?; // “enmity” is still selected: it is tagged as a noun.
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn without_attr(self, _key: impl Into<String>, _value: impl Into<Value>) -> Self {
-        todo!()
+    pub fn without_attr(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.conditions
+            .push(Condition::WithoutAttr(key.into(), value.into()));
+        self
     }
 
     /// Requires spans to contain the specified attribute key.
@@ -209,18 +445,19 @@ impl SpanFilter {
     /// # Example
     ///
     /// ```no_run
-    /// # use klause::{Document, Span, select_spans};
+    /// # use klause::{Document, Span, spans_in};
     /// # let mut doc = Document::new("GEN 3:15");
     /// # let range = doc.push("And I will put enmity")?;
     /// # doc.add_layer("words")?;
     /// # doc.add_span("words", Span::from(11..14).with_id("put"))?;
     /// # doc.add_span("words", Span::from(15..21).with_id("enmity").with_attr("pos", "noun"))?;
-    /// let tagged_words = select_spans("words").with_key("pos");
+    /// let tagged_words = spans_in("words").with_key("pos");
     /// let hits = doc.get_selection(tagged_words)?; // Only the tagged word “enmity” is selected.
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn with_key(self, _key: impl Into<String>) -> Self {
-        todo!()
+    pub fn with_key(mut self, key: impl Into<String>) -> Self {
+        self.conditions.push(Condition::WithKey(key.into()));
+        self
     }
 
     /// Excludes spans containing the specified attribute key.
@@ -228,18 +465,19 @@ impl SpanFilter {
     /// # Example
     ///
     /// ```no_run
-    /// # use klause::{Document, Span, select_spans};
+    /// # use klause::{Document, Span, spans_in};
     /// # let mut doc = Document::new("GEN 3:15");
     /// # let range = doc.push("And I will put enmity")?;
     /// # doc.add_layer("words")?;
     /// # doc.add_span("words", Span::from(11..14).with_id("put"))?;
     /// # doc.add_span("words", Span::from(15..21).with_id("enmity").with_attr("pos", "noun"))?;
-    /// let untagged_words = select_spans("words").without_key("pos");
+    /// let untagged_words = spans_in("words").without_key("pos");
     /// let hits = doc.get_selection(untagged_words)?; // The untagged word “put” is selected.
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn without_key(self, _key: impl Into<String>) -> Self {
-        todo!()
+    pub fn without_key(mut self, key: impl Into<String>) -> Self {
+        self.conditions.push(Condition::WithoutKey(key.into()));
+        self
     }
 
     /// Restricts matching to spans with the specified identifier.
@@ -247,18 +485,19 @@ impl SpanFilter {
     /// # Example
     ///
     /// ```no_run
-    /// # use klause::{Document, Span, select_spans};
+    /// # use klause::{Document, Span, spans_in};
     /// # let mut doc = Document::new("GEN 3:15");
     /// # let range = doc.push("And I will put enmity")?;
     /// # doc.add_layer("words")?;
     /// # doc.add_span("words", Span::from(11..14).with_id("put"))?;
     /// # doc.add_span("words", Span::from(15..21).with_id("enmity").with_attr("pos", "noun"))?;
-    /// let enmity = select_spans("words").with_id("enmity");
+    /// let enmity = spans_in("words").with_id("enmity");
     /// let hits = doc.get_selection(enmity)?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn with_id(self, _id: impl Into<SpanId>) -> Self {
-        todo!()
+    pub fn with_id(mut self, id: impl Into<SpanId>) -> Self {
+        self.conditions.push(Condition::WithId(id.into()));
+        self
     }
 
     /// Restricts matching to spans whose target matches another filter.
@@ -266,7 +505,7 @@ impl SpanFilter {
     /// # Example
     ///
     /// ```no_run
-    /// # use klause::{Document, Span, select_spans};
+    /// # use klause::{Document, Span, spans_in};
     /// # let mut doc = Document::new("GEN 3:15");
     /// # let range = doc.push("And I will put enmity")?;
     /// # doc.add_layer("verses")?;
@@ -276,25 +515,26 @@ impl SpanFilter {
     /// # doc.add_span("words", Span::from(15..21).with_id("enmity").with_attr("pos", "noun"))?;
     /// # doc.add_layer("notes")?;
     /// # doc.add_span("notes", Span::on_ref(&verse).with_attr("topic", "enmity"))?;
-    /// let verse = select_spans("verses").with_id("GEN 3:15");
-    /// let notes = select_spans("notes").targeting(verse);
+    /// let verse = spans_in("verses").with_id("GEN 3:15");
+    /// let notes = spans_in("notes").targeting(verse);
     /// let hits = doc.get_selection(notes)?; // The note on Genesis 3:15 is selected.
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn targeting(self, _target: SpanFilter) -> Self {
-        todo!()
+    pub fn targeting(mut self, target: SpanFilter) -> Self {
+        self.conditions.push(Condition::Targeting(Box::new(target)));
+        self
     }
 }
 
 impl From<&str> for SpanFilter {
     /// Creates a filter for spans in the named layer.
-    fn from(_layer: &str) -> Self {
-        todo!()
+    fn from(layer: &str) -> Self {
+        spans_in(layer)
     }
 }
 
 /// A condition on an attribute value, such as equality, a set of values, or a numeric range.
-pub trait ValueMatcher {
+pub trait ValueMatcher: Send + Sync {
     /// Returns whether this matcher accepts the given attribute value.
     ///
     /// # Example
@@ -306,39 +546,135 @@ pub trait ValueMatcher {
     /// assert!(!topic.matches(&Value::from("garden")));
     /// ```
     fn matches(&self, value: &Value) -> bool;
+
+    /// An exact value that can be used to narrow indexed candidates.
+    fn index_value(&self) -> Option<Value> {
+        None
+    }
 }
 
-macro_rules! value_matcher {
-    ($($source:ty),*) => {$(
-        impl ValueMatcher for $source {
-            fn matches(&self, _value: &Value) -> bool {
-                todo!()
+impl ValueMatcher for Value {
+    fn matches(&self, value: &Value) -> bool {
+        self == value
+    }
+
+    fn index_value(&self) -> Option<Value> {
+        Some(self.clone())
+    }
+}
+
+impl ValueMatcher for &str {
+    fn matches(&self, value: &Value) -> bool {
+        matches!(value, Value::Str(stored) if stored == *self)
+    }
+
+    fn index_value(&self) -> Option<Value> {
+        Some(Value::from(*self))
+    }
+}
+
+impl ValueMatcher for String {
+    fn matches(&self, value: &Value) -> bool {
+        matches!(value, Value::Str(stored) if stored == self)
+    }
+
+    fn index_value(&self) -> Option<Value> {
+        Some(Value::from(self.clone()))
+    }
+}
+
+impl ValueMatcher for i32 {
+    fn matches(&self, value: &Value) -> bool {
+        Value::Int(i64::from(*self)) == *value
+    }
+
+    fn index_value(&self) -> Option<Value> {
+        Some(Value::Int(i64::from(*self)))
+    }
+}
+
+impl ValueMatcher for i64 {
+    fn matches(&self, value: &Value) -> bool {
+        Value::Int(*self) == *value
+    }
+
+    fn index_value(&self) -> Option<Value> {
+        Some(Value::Int(*self))
+    }
+}
+
+impl ValueMatcher for f64 {
+    fn matches(&self, value: &Value) -> bool {
+        Value::Float(*self) == *value
+    }
+
+    fn index_value(&self) -> Option<Value> {
+        Some(Value::Float(*self))
+    }
+}
+
+impl ValueMatcher for bool {
+    fn matches(&self, value: &Value) -> bool {
+        matches!(value, Value::Bool(stored) if stored == self)
+    }
+
+    fn index_value(&self) -> Option<Value> {
+        Some(Value::Bool(*self))
+    }
+}
+
+macro_rules! range_matcher {
+    ($range:ty) => {
+        impl ValueMatcher for $range {
+            fn matches(&self, value: &Value) -> bool {
+                let Some(number) = numeric_value(value) else {
+                    return false;
+                };
+                number >= self.start as f64 && number < self.end as f64
             }
         }
-    )*};
+    };
 }
 
-value_matcher!(
-    Value,
-    &str,
-    String,
-    i32,
-    i64,
-    f64,
-    bool,
-    AnyOf,
-    Range<i32>,
-    RangeFrom<i32>,
-    Range<i64>,
-    RangeFrom<i64>,
-    Range<f64>,
-    RangeFrom<f64>
-);
+range_matcher!(Range<i32>);
+range_matcher!(Range<i64>);
+range_matcher!(Range<f64>);
+
+macro_rules! range_from_matcher {
+    ($range:ty) => {
+        impl ValueMatcher for $range {
+            fn matches(&self, value: &Value) -> bool {
+                let Some(number) = numeric_value(value) else {
+                    return false;
+                };
+                number >= self.start as f64
+            }
+        }
+    };
+}
+
+range_from_matcher!(RangeFrom<i32>);
+range_from_matcher!(RangeFrom<i64>);
+range_from_matcher!(RangeFrom<f64>);
+
+fn numeric_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int(value) => Some(*value as f64),
+        Value::Float(value) => Some(*value),
+        _ => None,
+    }
+}
 
 /// A value matcher that accepts any of the values supplied to [`any_of`].
 #[derive(Clone, Debug)]
 pub struct AnyOf {
-    _private: (),
+    values: Vec<Value>,
+}
+
+impl ValueMatcher for AnyOf {
+    fn matches(&self, value: &Value) -> bool {
+        self.values.iter().any(|candidate| candidate == value)
+    }
 }
 
 /// Creates a matcher that accepts any of the supplied values.
@@ -346,11 +682,13 @@ pub struct AnyOf {
 /// # Example
 ///
 /// ```no_run
-/// # use klause::{any_of, select_spans};
-/// let words = select_spans("words").with_attr("pos", any_of(["noun", "verb"]));
+/// # use klause::{any_of, spans_in};
+/// let words = spans_in("words").with_attr("pos", any_of(["noun", "verb"]));
 /// ```
-pub fn any_of<T: Into<Value>>(_values: impl IntoIterator<Item = T>) -> AnyOf {
-    todo!()
+pub fn any_of<T: Into<Value>>(values: impl IntoIterator<Item = T>) -> AnyOf {
+    AnyOf {
+        values: values.into_iter().map(Into::into).collect(),
+    }
 }
 
 /// Creates a reference to one span by layer and identifier.
@@ -358,17 +696,17 @@ pub fn any_of<T: Into<Value>>(_values: impl IntoIterator<Item = T>) -> AnyOf {
 /// # Example
 ///
 /// ```no_run
-/// # use klause::{Document, Span, select_span};
+/// # use klause::{Document, Span, span_id};
 /// # let mut doc = Document::new("GEN 3:15");
 /// # let range = doc.push("And I will put enmity")?;
 /// # doc.add_layer("verses")?;
 /// # let verse = doc.add_span("verses", Span::from(range.clone()).with_id("GEN 3:15"))?;
-/// let verse = select_span("verses", "GEN 3:15");
+/// let verse = span_id("verses", "GEN 3:15");
 /// let passage = doc.get_passage(verse)?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn select_span(_layer: impl Into<String>, _id: impl Into<SpanId>) -> SpanRef {
-    todo!()
+pub fn span_id(layer: impl Into<String>, id: impl Into<SpanId>) -> SpanRef {
+    SpanRef::new(layer, id)
 }
 
 /// Creates a filter matching spans in the named layer.
@@ -376,17 +714,17 @@ pub fn select_span(_layer: impl Into<String>, _id: impl Into<SpanId>) -> SpanRef
 /// # Example
 ///
 /// ```no_run
-/// # use klause::{Document, Span, select_spans};
+/// # use klause::{Document, Span, spans_in};
 /// # let mut doc = Document::new("GEN 3:15");
 /// # let range = doc.push("And I will put enmity")?;
 /// # doc.add_layer("verses")?;
 /// # let verse = doc.add_span("verses", Span::from(range.clone()).with_id("GEN 3:15"))?;
-/// let verses = select_spans("verses");
+/// let verses = spans_in("verses");
 /// let hits = doc.get_selection(verses)?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn select_spans(_layer: impl Into<String>) -> SpanFilter {
-    todo!()
+pub fn spans_in(layer: impl Into<String>) -> SpanFilter {
+    SpanFilter::in_layers(Some(vec![layer.into()]))
 }
 
 /// Creates a filter matching spans in every layer.
@@ -394,14 +732,14 @@ pub fn select_spans(_layer: impl Into<String>) -> SpanFilter {
 /// # Example
 ///
 /// ```no_run
-/// # use klause::{Document, Span, select_all_spans};
+/// # use klause::{Document, Span, all_spans};
 /// # let mut doc = Document::new("GEN 3:15");
 /// # let range = doc.push("And I will put enmity")?;
 /// # doc.add_layer("verses")?;
 /// # let verse = doc.add_span("verses", Span::from(range.clone()).with_id("GEN 3:15"))?;
-/// let hits = doc.get_selection(select_all_spans())?;
+/// let hits = doc.get_selection(all_spans())?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn select_all_spans() -> SpanFilter {
-    todo!()
+pub fn all_spans() -> SpanFilter {
+    SpanFilter::in_layers(None)
 }

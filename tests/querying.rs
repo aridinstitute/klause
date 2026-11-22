@@ -4,8 +4,7 @@ use std::ops::Range;
 
 use common::{GENESIS, at, genesis, verse};
 use klause::{
-    Distance, Document, Error, Span, SpanId, Target, Value, select_all_spans, select_span,
-    select_spans,
+    Distance, Document, Error, Span, SpanId, Target, Value, all_spans, span_id, spans_in,
 };
 
 fn hits(query: klause::Query<'_>) -> Vec<Range<u32>> {
@@ -13,11 +12,11 @@ fn hits(query: klause::Query<'_>) -> Vec<Range<u32>> {
 }
 
 fn nouns() -> klause::SpanFilter {
-    select_spans("morph").with_attr("pos", "noun")
+    spans_in("morph").with_attr("pos", "noun")
 }
 
 fn verbs() -> klause::SpanFilter {
-    select_spans("morph").with_attr("pos", "verb")
+    spans_in("morph").with_attr("pos", "verb")
 }
 
 #[test]
@@ -52,14 +51,14 @@ fn within_outside_and_layer_steps_narrow_the_hits() {
         hits(
             doc.find()
                 .in_span("verses", "GEN 1:1")
-                .outside(select_spans("words"))
+                .outside(spans_in("words"))
         ),
         gaps
     );
     assert_eq!(
         hits(
             doc.find()
-                .within(select_span("verses", "GEN 1:2"))
+                .within(span_id("verses", "GEN 1:2"))
                 .in_layer("words")
         )
         .len(),
@@ -138,8 +137,8 @@ fn followed_by_and_preceded_by_keep_hits_with_a_neighbour_within_the_distance() 
     );
     // Punctuation and whitespace count as adjacent.
     assert_eq!(
-        hits(doc.find().within(select_span("words", 10_u64)).followed_by(
-            select_spans("morph").with_attr("pos", "adv"),
+        hits(doc.find().within(span_id("words", 10_u64)).followed_by(
+            spans_in("morph").with_attr("pos", "adv"),
             Distance::adjacent()
         )),
         [at("earth", 0)]
@@ -190,8 +189,8 @@ fn expand_to_replaces_the_hits_and_only_later_steps_see_the_new_ones() {
     assert_eq!(
         hits(
             doc.find()
-                .within(select_span("words", 4_u64))
-                .expand_to(select_spans("verses"))
+                .within(span_id("words", 4_u64))
+                .expand_to(spans_in("verses"))
         ),
         [verse(1)]
     );
@@ -204,7 +203,7 @@ fn get_spans_returns_spans_touching_the_hits_by_start_then_layer_order() {
     let spans = doc
         .find()
         .within(at("God", 0))
-        .get_spans(select_all_spans())
+        .get_spans(all_spans())
         .unwrap();
 
     assert_eq!(
@@ -225,7 +224,7 @@ fn get_spans_returns_spans_touching_the_hits_by_start_then_layer_order() {
 
     let verses = doc
         .find()
-        .within(select_spans("morph").with_attr("strongs", "H776"))
+        .within(spans_in("morph").with_attr("strongs", "H776"))
         .get_spans("verses")
         .unwrap();
     assert_eq!(verses.len(), 2);
@@ -327,7 +326,7 @@ fn queries_fail_when_a_step_or_verb_names_an_unknown_layer() {
         Err(Error::UnknownLayer(_))
     ));
     assert!(matches!(
-        doc.get_selection(select_spans("missing")),
+        doc.get_selection(spans_in("missing")),
         Err(Error::UnknownLayer(_))
     ));
 }

@@ -3,7 +3,7 @@
 mod common;
 
 use common::Highlights;
-use klause::{Document, Layer, Span, SpanId, Value, select_span, select_spans};
+use klause::{Document, Layer, Span, SpanId, Value, span_id, spans_in};
 
 const VERSE: &str = "And I will put enmity between you and the woman, and between your seed \
                      and her seed. He will crush your head, and you will strike his heel.”";
@@ -131,9 +131,7 @@ fn bible() -> Document {
 fn reading_a_verse_for_display() {
     let bible = bible();
 
-    let p = bible
-        .get_passage(select_span("verses", "GEN 3:15"))
-        .unwrap();
+    let p = bible.get_passage(span_id("verses", "GEN 3:15")).unwrap();
     assert_eq!(p.range(), 0..142);
     assert_eq!(p.text(), VERSE);
 
@@ -196,7 +194,7 @@ fn searching_by_word_and_by_reverse_cross_reference() {
         verse_ids(
             bible
                 .find()
-                .within(select_spans("morph").with_attr("strongs", "H342"))
+                .within(spans_in("morph").with_attr("strongs", "H342"))
                 .get_spans("verses")
                 .unwrap()
         ),
@@ -206,7 +204,7 @@ fn searching_by_word_and_by_reverse_cross_reference() {
         verse_ids(
             bible
                 .find()
-                .within(select_spans("xrefs").with_attr("to", "ROM 16:20"))
+                .within(spans_in("xrefs").with_attr("to", "ROM 16:20"))
                 .get_spans("verses")
                 .unwrap()
         ),
@@ -215,7 +213,7 @@ fn searching_by_word_and_by_reverse_cross_reference() {
     assert!(
         bible
             .find()
-            .within(select_spans("xrefs").with_attr("to", "REV 12:17"))
+            .within(spans_in("xrefs").with_attr("to", "REV 12:17"))
             .get_spans("verses")
             .unwrap()
             .is_empty()
@@ -231,9 +229,7 @@ fn saving_a_highlight_from_a_selection_on_screen() {
         .unwrap();
 
     // The user selects "ity betw" on screen, in passage-local positions.
-    let p = bible
-        .get_passage(select_span("verses", "GEN 3:15"))
-        .unwrap();
+    let p = bible.get_passage(span_id("verses", "GEN 3:15")).unwrap();
     let local = 18..26;
     assert_eq!(&p.text()[18..26], "ity betw");
     let start = p.range().start;
@@ -250,9 +246,7 @@ fn saving_a_highlight_from_a_selection_on_screen() {
             .with_attr("color", "yellow"),
     );
 
-    let p = bible
-        .get_passage(select_span("verses", "GEN 3:15"))
-        .unwrap();
+    let p = bible.get_passage(span_id("verses", "GEN 3:15")).unwrap();
     let highlights: Vec<_> = p.spans_in("highlights").collect();
     assert_eq!(highlights.len(), 1);
     assert_eq!(highlights[0].text(), ["enmity", "between"]);

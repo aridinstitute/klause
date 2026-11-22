@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::{fmt, ops::Range};
 
 use crate::document::Span;
@@ -34,7 +34,7 @@ pub trait SpanSource: Send + Sync {
     /// # Example
     ///
     /// ```no_run
-    /// # use klause::{SourceError, Span, SpanSource, select_spans};
+    /// # use klause::{SourceError, Span, SpanSource, spans_in};
     /// # struct EnmityHighlight;
     /// # impl SpanSource for EnmityHighlight {
     /// #     fn get_spans(&self, range: std::ops::Range<u32>) -> Result<Vec<Span>, SourceError> {
@@ -45,7 +45,7 @@ pub trait SpanSource: Send + Sync {
     /// #         })
     /// #     }
     /// # }
-    /// let nouns = select_spans("highlights").with_attr("topic", "enmity");
+    /// let nouns = spans_in("highlights").with_attr("topic", "enmity");
     /// // This source uses the default fallback to range-based loading.
     /// assert!(EnmityHighlight.find_spans(&nouns).is_none());
     /// ```
@@ -57,7 +57,7 @@ pub trait SpanSource: Send + Sync {
 /// An error reported by a `SpanSource`.
 #[derive(Debug)]
 pub struct SourceError {
-    _private: (),
+    error: Box<dyn core::error::Error + Send + Sync>,
 }
 
 impl SourceError {
@@ -70,15 +70,21 @@ impl SourceError {
     /// let err = std::io::Error::other("could not load highlights for Genesis 3:15");
     /// let source_error = SourceError::new(err);
     /// ```
-    pub fn new(_error: impl core::error::Error + Send + Sync + 'static) -> Self {
-        todo!()
+    pub fn new(error: impl core::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            error: Box::new(error),
+        }
     }
 }
 
 impl fmt::Display for SourceError {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
     }
 }
 
-impl core::error::Error for SourceError {}
+impl core::error::Error for SourceError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&*self.error)
+    }
+}

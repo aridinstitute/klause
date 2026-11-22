@@ -3,7 +3,7 @@ mod common;
 use std::sync::atomic::Ordering;
 
 use common::{Highlights, at, genesis};
-use klause::{Error, Layer, Span, SpanRef, Value, select_span, select_spans};
+use klause::{Error, Layer, Span, SpanRef, Value, span_id, spans_in};
 
 fn with_highlights() -> (klause::Document, Highlights) {
     let mut doc = genesis();
@@ -21,7 +21,7 @@ fn source_spans_are_read_fresh_for_every_passage_and_query() {
             .with_id(1_u64)
             .with_attr("color", "yellow"),
     );
-    let verse = || doc.get_passage(select_span("verses", "GEN 1:1")).unwrap();
+    let verse = || doc.get_passage(span_id("verses", "GEN 1:1")).unwrap();
 
     let before = verse();
     assert_eq!(before.spans_in("highlights").count(), 1);
@@ -45,7 +45,7 @@ fn source_spans_are_read_fresh_for_every_passage_and_query() {
     );
     assert_eq!(
         doc.find()
-            .within(select_spans("highlights").with_attr("color", "green"))
+            .within(spans_in("highlights").with_attr("color", "green"))
             .get_spans("words")
             .unwrap()
             .len(),
@@ -59,7 +59,7 @@ fn source_spans_can_target_stored_spans_and_missing_targets_are_skipped() {
     highlights.save(Span::on("words", 5_u64).with_id(1_u64));
     highlights.save(Span::on("words", 99_u64).with_id(2_u64));
 
-    let passage = doc.get_passage(select_span("verses", "GEN 1:1")).unwrap();
+    let passage = doc.get_passage(span_id("verses", "GEN 1:1")).unwrap();
     let spans: Vec<_> = passage.spans_in("highlights").collect();
 
     assert_eq!(spans.len(), 1);
@@ -101,7 +101,7 @@ fn a_failing_source_still_loads_passages_but_fails_queries_that_need_it() {
     );
     highlights.down.store(true, Ordering::SeqCst);
 
-    let passage = doc.get_passage(select_span("verses", "GEN 1:1")).unwrap();
+    let passage = doc.get_passage(span_id("verses", "GEN 1:1")).unwrap();
     assert!(passage.error("highlights").is_some());
     assert!(passage.error("words").is_none());
     assert_eq!(passage.spans_in("highlights").count(), 0);
