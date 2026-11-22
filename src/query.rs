@@ -262,11 +262,7 @@ impl<'a> Query<'a> {
     pub(crate) fn matched_spans(self, filter: &SpanFilter) -> Result<Vec<MatchedSpan>, Error> {
         let doc = self.doc;
         let hits = Self::execute(doc, self.steps)?;
-        let mut spans: Vec<MatchedSpan> = doc
-            .matching_spans(filter)?
-            .into_iter()
-            .filter(|span| span_ranges_touch(&span.ranges, &hits))
-            .collect();
+        let mut spans = doc.matching_spans_touching(filter, &hits)?;
         spans.sort_by_key(|span| {
             (
                 span.ranges.first().map_or(u32::MAX, |range| range.start),
