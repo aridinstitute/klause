@@ -1,30 +1,16 @@
-//! The smallest useful flow: push text, annotate it, read it back.
-//!
-//! API sketch only; this does not compile yet.
-
-use klause::{Document, Span, spans};
+//! Create a document, annotate its text, and query it.
+use klause::{Document, spans_in};
 
 fn main() -> Result<(), klause::Error> {
-    let mut doc = Document::new("greeting");
-
-    let hello = doc.push_span("words", "Hello", |s| s)?;
-    doc.push(", ")?;
-    let world = doc.push_span("words", "world", |s| s)?;
+    let mut doc = Document::new("greeting").with_layer("words");
+    doc.push("Hello, ")?;
+    doc.push_span("words", "world", |span| span.with_attr("pos", "noun"))?;
     doc.push("!")?;
 
-    doc.add_span("pos", Span::from(hello).with_attr("tag", "interjection"))?;
-    doc.add_span("pos", Span::from(world).with_attr("tag", "noun"))?;
-
-    let nouns = doc.find().covered_by(spans("pos").attr("tag", "noun")).get_selection()?;
-    assert_eq!(nouns.ranges(), [("greeting", 7..12)]);
-
-    let p = doc.get_passage(..)?;
-    assert_eq!(p.text(), "Hello, world!");
-
-    for span in p.spans() {
-        span.layer(); // "words", "words", "pos", "pos"
-        p.text_of(&span); // ["Hello"], ["world"], ["Hello"], ["world"]
-    }
-
+    let passage = doc
+        .find()
+        .within(spans_in("words").with_attr("pos", "noun"))
+        .get_passage()?;
+    assert_eq!(passage.text(), "world");
     Ok(())
 }

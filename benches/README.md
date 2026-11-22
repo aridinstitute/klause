@@ -236,3 +236,108 @@ builder order. `expand_to` is a hard boundary. See `DESIGN.md` for the semantics
 This benchmark is not the complete Bible fixture and does not establish the
 whole-document folded-search target, full-workload resident memory, proximity
 performance, or the build-through-first-query target.
+
+## Cross-document corpus
+
+```sh
+cargo bench --locked --bench corpus -- --noplot
+```
+
+The generated corpus contains 1, 12, or 66 documents, each with 12,000 word
+spans. One in eight words is tagged as a verb, and one in three documents has
+`language = "fr"`. The timed cases include query construction but not fixture
+construction. Warm cases reuse the documents and indexes. The first span count
+uses a fresh corpus on each iteration and includes lazy attribute indexing.
+
+Apple M4 Pro, single-threaded release build, Criterion point estimates:
+
+| Operation | 1 document | 12 documents | 66 documents (792,000 words) |
+| :-- | --: | --: | --: |
+| Warm verb span count | 17.0 µs | 293 µs | 7.29 ms |
+| Literal three-word phrase count | 26.5 µs | 325 µs | 1.75 ms |
+| Part-of-speech value counts | 167 µs | 3.00 ms | 22.36 ms |
+| Metadata-scoped warm verb span count | 17.0 µs | 73.3 µs | 814 µs |
+| First verb span count | — | — | 46.56 ms |
+
+The baseline value-count case took 93.34 ms at 66 documents. Counting from
+borrowed stored spans instead of cloning them, and avoiding a per-span
+allocation for duplicate checks, brought that case down to 22.36 ms. This case
+has only two distinct values and does not measure high-cardinality aggregation
+such as Strong's frequencies. This suite also does not validate the complete
+single-document Bible workload or its memory target.
+
+## Full Bible workload
+
+```sh
+cargo bench --locked --bench bible_workload -- --noplot
+cargo bench --locked --bench bible_workload -- --rss
+cargo bench --locked --bench bsb_usj -- 'full_.*phrase' --noplot
+```
+
+`bible_workload` generates one document with about 4.5 MB of text, 66 books,
+1,189 chapters, 31,102 verses, 790,000 words and as many morphology spans,
+50,000 structure spans, 20,000 point notes, and 340,000 cross-references. Every
+morphology span has a part of speech and one of 5,600 Strong’s IDs; half the
+words draw from 128 common IDs. A range-indexed, in-memory source serves
+10,000 highlights without external I/O. The fixture is deterministic and
+models annotation volumes, not the distribution of a particular Bible export.
+
+Apple M4 Pro, macOS arm64, 48 GiB RAM, single-threaded release build. Timings
+are Criterion point estimates (10 samples). Cold cases use a fresh document
+and include lazy index construction but exclude document build and destruction.
+Build-through-first-chapter starts with prepared rows, includes constructing the
+document and reading an all-layer chapter, and excludes destroying the document.
+
+| Operation | Design target | Cold | Warm |
+| :-- | --: | --: | --: |
+| Build through first chapter | < 1 s | 661 ms | — |
+| Chapter passage, all layers | < 1 ms | 46.5 ms | 224 µs |
+| Bible-wide verb selection | < 20 ms | 149 ms | 9.79 ms |
+| Bible-wide Strong’s counts | < 50 ms | — | 1.84 s |
+| Reverse cross-reference lookup | < 1 ms | 55.9 ms | 2.42 ms |
+
+The standalone `--rss` process uses `ps` on macOS/Linux to sample current
+resident memory, not peak memory. It reported **759.7 MB** loaded (before
+indexes), and **947.7 MB** after chapter, verb, and reverse-reference queries,
+against a **400 MB** target. The process started at 2.2 MB. Rows are dropped
+before the loaded snapshot; RSS can still include allocator-retained pages.
+
+### Folded search vs. verse materialization
+
+The folded-selection case includes matching and returning hit ranges.
+The verse-only case starts from those precomputed ranges; it times the current
+`get_spans` path, including filtering and materialization. The combined case
+runs the normal query in one chain. These are independent timings, not an
+additive breakdown. The synthetic query is three words with eight hits;
+real BSB uses “for god so loved the world” and finds one verse.
+
+| Operation | Full synthetic workload | Real BSB USJ |
+| :-- | --: | --: |
+| Folded search → selection | 93.6 ms | 78.3 ms |
+| Precomputed hits → verse spans | 2.32 ms | 6.25 ms |
+| Folded search → verse spans | 97.6 ms | 88.4 ms |
+
+Matching dominates the combined search on both fixtures and exceeds the 30 ms
+target on its own. Verse materialization is smaller but still enough to exceed
+the 1 ms budget for reverse lookup, which uses the same span-returning path.
+
+### Keyed aggregation and streaming fold
+
+Same machine and release settings; default features. Before values are from the
+baseline above. These cases were re-run; the other baselines were not remeasured.
+
+| Operation | Before | After | Target |
+| :-- | --: | --: | --: |
+| Synthetic Strong’s counts (5,600 distinct values) | 1.84 s | 36.3 ms | < 50 ms |
+| Synthetic folded phrase → selection | 93.6 ms | 10.0 ms | < 30 ms |
+| Synthetic precomputed hits → verse spans | 2.32 ms | 2.46 ms | — |
+| Synthetic folded phrase → verse spans | 97.6 ms | 12.5 ms | — |
+| Real BSB folded phrase → selection | 78.3 ms | 9.45 ms | — |
+| Real BSB precomputed hits → verse spans | 6.25 ms | 6.64 ms | — |
+| Real BSB folded phrase → verse spans | 88.4 ms | 15.8 ms | — |
+
+High-cardinality counts now use a per-query hash map (`BTreeMap` without
+`std`), while the two-value corpus fixture stays on a small linear accumulator.
+Its 66-document value count was 23.1 ms versus the earlier 22.36 ms.
+Folded search now streams matches with pattern-sized scratch storage and no
+persistent cache. Verse materialization was not changed.

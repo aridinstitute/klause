@@ -2,20 +2,18 @@
 name = "klause"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-description = "TODO: one-sentence description of the Klause library."
+rust-version = "1.88"
+description = "Store, render, and query annotated text in memory."
 license = "MIT"
 repository = "https://github.com/aridinstitute/klause"
 readme = "README.md"
 
-# Opt in to targets as the API sketches are turned into compiling code.
+# Explicit targets keep the examples and integration test suites intentional.
 autoexamples = false
 autotests = false
 
-# TODO: Add keywords (at most 5, each 20 characters or fewer) and categories
-# before publishing to crates.io. See <https://crates.io/category_slugs>.
-# keywords = [""]
-# categories = [""]
+keywords = ["text", "annotations", "corpus"]
+categories = ["text-processing"]
 
 [features]
 default = ["std"]
@@ -27,6 +25,8 @@ unicode-normalization = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [[test]]
 name = "document"
@@ -49,6 +49,22 @@ name = "sources"
 [[test]]
 name = "bible"
 
+[[test]]
+name = "corpus"
+
+[[example]]
+name = "corpus"
+
+[[example]]
+name = "quickstart"
+
+[[test]]
+name = "bsb_usj"
+
+[[bench]]
+name = "bsb_usj"
+harness = false
+
 [[bench]]
 name = "document_creation"
 harness = false
@@ -63,4 +79,12 @@ harness = false
 
 [[bench]]
 name = "planning"
+harness = false
+
+[[bench]]
+name = "corpus"
+harness = false
+
+[[bench]]
+name = "bible_workload"
 harness = false

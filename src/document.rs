@@ -679,7 +679,7 @@ impl Document {
         let indices = self.matching_layer_indices(filter)?;
         // Source results must still be validated, even when hits are empty.
         // Keeping the full source read also preserves its error behavior.
-        if hits.ranges() == [0..self.len()] {
+        if hits.ranges() == core::slice::from_ref(&(0..self.len())) {
             return self.selection_for_filter(filter);
         }
         if indices.iter().any(|&index| self.layers[index].is_source()) {
@@ -748,7 +748,7 @@ impl Document {
         hits: &Selection,
     ) -> Result<usize, Error> {
         let mut count = 0;
-        let full = hits.ranges() == [0..self.len()];
+        let full = hits.ranges() == core::slice::from_ref(&(0..self.len()));
         for index in self.matching_layer_indices(filter)? {
             let layer = &self.layers[index];
             if full && !filter.has_conditions() && !layer.is_source() {
@@ -915,6 +915,37 @@ impl Document {
             }
         }
         Ok(matches)
+    }
+
+    // Visit borrowed stored spans for aggregation, in the same order as
+    // matching_spans without conditions. Source spans still use the usual
+    // filter pushdown, validation, and error handling.
+    pub(crate) fn visit_layer_spans_touching(
+        &self,
+        layer_id: &str,
+        hits: &Selection,
+        mut visit: impl FnMut(&Span),
+    ) -> Result<(), Error> {
+        let layer = self
+            .layer(layer_id)
+            .ok_or_else(|| Error::UnknownLayer(layer_id.into()))?;
+        if layer.is_source() {
+            let filter = crate::spans_in(layer_id);
+            for span in self.read_source_spans(layer, &filter)? {
+                if let Some(ranges) = self.matching_source_ranges(layer, &filter, &span)? {
+                    if span_ranges_touch(&ranges, hits) {
+                        visit(&span);
+                    }
+                }
+            }
+        } else {
+            for slot in layer.slots_in_position_order() {
+                if span_ranges_touch(&layer.resolved_ranges[slot], hits) {
+                    visit(layer.spans[slot].as_ref().unwrap());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn passage(

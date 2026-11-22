@@ -6,12 +6,15 @@ text". It is a general library. The workload it is tuned for is a Bible: the ful
 chapters, books, morphology on every word, poetry and paragraph structure, footnotes, cross-references, and a user's
 highlights kept in an application database.
 
-Klause keeps documents in memory. Reading them from and writing them to files or databases belongs to the
-application, through the `IntoDocument` trait and the document's read accessors.
+Klause keeps documents in memory. A corpus applies the same query to multiple documents and combines the results
+without sharing their offsets or annotation layers. Reading and writing files or databases belongs to the application,
+through `IntoDocument` and read accessors.
 
 ## Concepts
 
 - **`Document`**: an ID, attributes, a UTF-8 text that only grows at the end, and named layers.
+- **`Corpus`**: documents indexed by unique IDs, with independent layers and byte offsets.
+- **`CorpusQuery`**: selects documents, runs a `Query` in each, then returns document-qualified results or aggregate counts.
 - **`Span`**: one annotation. It marks some of the document's text, has attributes, and has an ID unique in its
   layer.
 - **`Layer`**: a named group of spans. A *stored* layer keeps its spans in the document. A *source* layer asks your
@@ -29,8 +32,8 @@ application, through the `IntoDocument` trait and the document's read accessors.
 
 These words have exact meanings everywhere in this document and in the API docs.
 
-- **Position**: a byte offset into the document's text, as `u32`. Always on a UTF-8 character boundary.
-- **Range**: `start..end` of positions, end-exclusive. A Rust `&str` slices with it directly.
+- **Position**: a document-local byte offset into the NFC-normalized text, as `u32`. Always on a UTF-8 character boundary.
+- **Range**: `start..end` of positions, end-exclusive. Cast the bounds to `usize` to slice a Rust `&str`, or use `Document::slice`.
 - **Point**: a range with `start == end`. It marks the gap between two characters, such as where a footnote marker
   goes.
 - **A span's ranges**: the text positions a span marks. A span that targets text has the ranges it was given. A span
@@ -44,9 +47,9 @@ These words have exact meanings everywhere in this document and in the API docs.
 
 The API is fluent: values are built by chaining methods, and chains read as sentences.
 
-- **Builders** never fail. `with_*` adds, `set_*` replaces, and `remove_*` removes:
-  `Span::from(0..3).with_id(1).with_attr("pos", "noun")`. `Document`, `Layer`, `Span`, `SpanFilter`, and `Query`
-  are all built this way.
+- **Builders** return the object for chaining. For attributes, `with_attr` appends, `set_attr` replaces, and
+  `remove_attr` removes all values for a key. `with_layer` panics on a duplicate layer ID; use `add_layer` for a
+  recoverable error.
 - **Span selectors name their result**: `spans_in("morph")` and `all_spans()` create span filters;
   `span_id("verses", "GEN 3:15")` creates a reference to one span. They describe text for a query step or
   passage to read, and are resolved when it runs.
@@ -92,15 +95,15 @@ doc.attr("language");                     // Some(&Value::Str("en"))
 
 ### Normalisation
 
-Each push is normalised to Unicode NFC, and the returned range points into the normalised text. A push is rejected
-with `Error::SplitsCharacter` when normalising the last character already in the text together with the new text
-would differ from that character followed by the normalised push, as happens when a push starts with a combining
-mark such as a Hebrew vowel point. This keeps every earlier position valid.
+Each push is normalized to Unicode NFC, and the returned range points into the normalized text. The implementation
+checks the join using the existing suffix from its last character with canonical combining class zero (or the whole
+existing text if none). If the join would change NFC, `push` returns `Error::SplitsCharacter` instead of changing
+previous bytes. Leading combining marks are allowed when the join is already NFC.
 
 ### Pushing text with a span
 
 `push_span` pushes text and adds a span over it. The closure receives the new span's builder to set its ID and
-attributes. It returns the range, like `push`.
+attributes. It returns the range, like `push`. If inserting the span returns an error, the append is rolled back.
 
 ```rust
 let r = doc.push_span("words", "beginning", |s| s.with_id(1_001_001_003_u64))?;
@@ -174,6 +177,8 @@ Span::on_ref(&span_ref)                       // another span, by SpanRef
 - A span that targets another span follows it: its ranges are always that span's current ranges. Morphology tags
   target word spans this way.
 - A span can only target a span that already exists, so chains of targets never form a cycle.
+- There is no link target. Model a cross-reference as an ordinary span targeting its local origin with a destination
+  identifier stored as an attribute, and resolve that destination in application code.
 
 ```rust
 use klause::Target;
@@ -205,18 +210,18 @@ let s = s.remove_attr("strongs");
 s.attrs();                        // (key, value) pairs, keys in the order first added
 ```
 
-- `Value` converts from `&str`, `String`, integers (stored as `i64`), floats (stored as `f64`), and `bool`.
+- `Value` converts from `&str`, `String`, `i32`, `i64`, `u32`, `f64`, and `bool`. Integers are stored as `i64`.
 - Passing an array or `Vec` to `with_attr` adds each element as a separate value.
 - A filter on a key matches when any of the key's values matches.
 - Integers and floats compare as numbers, so `2` equals `2.0`.
-- Values sort as: null, then `false`, `true`, then numbers in numeric order, then strings in byte order.
+- Value-count ties sort by null, then `false`, `true`, numbers, and strings (in byte order). Mixed integer/float sort comparisons and numeric range filters convert integers to `f64`, which can round large values.
 
-`Document` and `Layer` have the same attribute builders and accessors.
+`Document` and `Span` expose the same attribute builders and accessors. `Layer` exposes `with_attr` and `attrs` only.
 
 ### IDs
 
 A span ID is a string or a `u64`, unique within its layer. `add_span` gives a span without an ID one more than the
-largest integer ID in its layer, or 1 when the layer has none.
+largest integer ID in its layer, or 1 when the layer has none. Automatic assignment panics if that ID would exceed `u64::MAX`.
 
 ```rust
 let r = doc.add_span("morph", Span::on("words", 1_001_001_003_u64).with_attr("pos", "noun"))?;
@@ -240,9 +245,10 @@ doc.remove_span(&r)?;
 - `add_span` fails when the layer doesn't exist (`UnknownLayer`), the layer is a source layer (`ReadOnlyLayer`), the
   target span doesn't exist (`UnknownSpan`), a range is outside the text (`OutOfRange`) or off a character boundary
   (`NotCharBoundary`), or the ID is taken (`DuplicateId`).
-- `replace_span` fails for the same reasons, and with `Cycle` when the new target is the span itself or a span that
-  targets it, directly or through a chain. Spans that target the replaced span now follow its new ranges.
-- `remove_span` also removes every span that targets the removed span, directly or through a chain, in every layer.
+- `replace_span` requires an existing stored span, validates the new target, and rejects cycles with `Cycle`. It ignores
+  the replacement's ID. Stored spans targeting the replaced span follow its new ranges.
+- `remove_span` cascades through stored spans that target the removed span, directly or through a chain, in any layer.
+  Source layers are never edited; a source span whose stored target was removed is skipped on read.
 
 ## Layers
 
@@ -337,13 +343,13 @@ so consecutive verses become one passage; for one passage per verse, call `get_p
 A passage contains every span, in the layers it includes, that touches its range. A span that targets another span
 has that span's ranges, so it is included whenever its target is.
 
-A passage is owned, cheap to clone, and `Send + Sync`. It shares the document's text instead of copying it.
+A passage is owned and `Send + Sync`. It shares the text through an `Arc`; cloning a passage clones its annotations and local range lists.
 
 ```rust
 p.range();                  // 0..142, in document positions
 p.text();                   // the text of that range
 
-for s in p.spans() {        // every included layer, in the order the layers were added, then by start
+for s in p.spans() {        // included layers in document order, then by the start of the clipped range
     s.layer();              // "structure"
     s.local();              // [0..47]: its ranges relative to p.text(), clipped to the passage
     s.text();               // ["And I will put enmity between you and the woman"]
@@ -382,28 +388,28 @@ doc.find()
 | `.outside(x)`             | The parts of the hits not inside `x`'s selection.                                        |
 | `.in_layer(id)`           | `.within(spans_in(id))`: the parts of the hits inside any span of the layer.         |
 | `.in_span(layer, id)`     | `.within(span_id(layer, id))`: the parts of the hits inside that span.               |
-| `.with_text(t)`           | Every occurrence of the string `t` that lies wholly inside one hit range.                |
-| `.with_text_folded(t)`    | The same, comparing case-insensitively and ignoring combining marks.                     |
+| `.with_text(t)`           | Non-overlapping literal matches wholly inside each hit range.                           |
+| `.with_text_folded(t)`    | Matches after lowercasing and removing combining marks, including overlapping candidates. |
 | `.followed_by(f, d)`      | The hit ranges that have a range of a span matching `f` starting after them within `d`.  |
 | `.preceded_by(f, d)`      | The hit ranges that have a range of a span matching `f` ending before them within `d`.   |
 | `.expand_to(f)`           | The union of the ranges of every span matching `f` that touches a hit range.             |
 
 `x` is any `IntoSelection`; `f` is a `SpanFilter` or a layer ID.
 
-`with_text_folded` compares the NFD form of both strings with combining marks (general category `Mn`) removed and
-full Unicode lowercasing applied. "elohim" matches "ʾĔlōhîm" except for the leading ʾ (a letter, not a mark), and
-"אלהים" matches "אֱלֹהִים" regardless of vowel points and cantillation. Matches are reported as ranges of the original
-text.
+`with_text_folded` decomposes each character (NFD), removes Unicode marks (`Mn`, `Mc`, and `Me`), and applies Rust's
+per-character Unicode lowercasing, not full Unicode case folding. Each candidate is mapped back to the source byte
+range. Both text steps return no hits for an empty pattern (including a folded pattern that becomes empty); their
+returned selections merge touching or overlapping matches.
 
 `Distance` is one of:
 
 - `Distance::adjacent()`: only whitespace (`White_Space`) and punctuation (general category `P*`) in between;
-- `Distance::at_most(n, layer)`: at most `n` spans of `layer` lie wholly in between;
+- `Distance::at_most(n, layer)`: at most `n` distinct spans in `layer` have at least one range wholly inside the gap;
 - `Distance::bytes(n)`: at most `n` bytes in between.
 
 **Order.** Between two `expand_to` steps, selection restrictions (`within`, `outside`, `in_layer`, and `in_span`)
 run first, text searches second, and proximity filters last, regardless of where those steps appear in the chain.
-Thus `with_text("the earth").in_layer("words")` searches inside each word, not across word boundaries. The planner
+For example, `with_text("the earth").in_span("verses", "GEN 1:1")` searches only in the selected verse. The planner
 uses layer sizes and available attribute-index cardinalities to order selection work, and uses narrowed hits to
 choose between position and attribute lookups. Planning never reads a source or builds an index just to estimate
 its cost. Selectors are resolved only at the final verb, including application-defined `IntoSelection` inputs.
@@ -411,7 +417,7 @@ its cost. Selectors are resolved only at the final verb, including application-d
 Text searches retain their relative order because each searches within the matches of the preceding search.
 Selection steps that may contain points also retain their place among selection steps: inclusive point
 boundaries make their order significant. Unknown custom selectors and source selectors are treated
-conservatively in the same way. Proximity filters are ordered by estimated candidate counts after text search.
+conservatively in the same way. Proximity filters run after text search; their order is estimated before execution.
 `expand_to` replaces the hits and is a hard planning boundary: steps before it see the old hits and steps after it
 see the new ones. A step's errors still surface even if an earlier planned step produces no hits.
 
@@ -428,18 +434,62 @@ see the new ones. A step's errors still surface even if an earlier planned step 
 | `.get_spans(f)`               | `Vec<Span>`           | Spans matching `f` that touch a hit, by start, then layer order.          |
 | `.count()`                    | `usize`               | The number of hit ranges.                                                 |
 | `.count_spans(f)`             | `usize`               | The number of spans matching `f` that touch a hit.                        |
-| `.count_values(layer, key)`   | `Vec<(Value, usize)>` | For each value of `key`, the number of spans in `layer` touching a hit that have it. Most frequent first, ties in value order. |
+| `.count_values(layer, key)`   | `Vec<(Value, usize)>` | Counts each touching span once per equal value of `key`. Most frequent first, ties in value order. |
 
-Final verbs fail when a step names a layer that doesn't exist (`UnknownLayer`), or needs a source layer that failed
-(`Source`). A query can't give correct results without that layer, so unlike a passage, it fails.
+A missing layer required by a query step produces `UnknownLayer`; a source error while resolving a step or span/count
+result produces `Source`. A source error while merely loading annotations for a passage is attached to that passage
+instead, so its text and the other annotations are still available.
 
-The document shortcuts are these chains:
+`doc.get_selection(x)`, `doc.get_passages(x)`, and `doc.get_passage(x)` resolve `x` directly. For built-in selectors the
+results match the corresponding `doc.find().within(x)` chains. Custom selectors can also supply a query-specific
+`into_selection_within` implementation.
+
+## Corpora
+
+`Corpus::new()` creates an empty collection. `add_document(doc)` takes ownership and rejects duplicate IDs.
+`document(id)` borrows a document, `documents()` iterates in ascending ID order, and `remove_document(id)` returns
+ownership. To edit a document in place logically, remove it, edit it, and add it back under its ID.
+
+`corpus.find()` starts with all documents. `in_documents(ids)` replaces the eligible ID list, deduplicates it, and
+validates every requested ID at execution. `filter_documents` takes a predicate on `&Document`, so callers can select
+by metadata (`attr` or `values`) or layer availability. Multiple predicates are ANDed and run before document queries,
+regardless of their placement in the chain. Each selected document gets a fresh query with the same steps and its own
+planner and indexes. `within` and `outside` take cloneable `IntoSelection` values, resolved separately in each document.
+Text and proximity matches cannot cross document boundaries.
 
 ```rust
-doc.get_selection(x)    // doc.find().within(x).get_selection()
-doc.get_passages(x)     // doc.find().within(x).get_passages()
-doc.get_passage(x)      // doc.find().within(x).get_passage()
+use klause::{Corpus, Document, Value, spans_in};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut corpus = Corpus::new();
+    for (id, text) in [("fr", "Café"), ("en", "cafe")] {
+        let mut doc = Document::new(id).with_layer("words");
+        doc.push_span("words", text, |s| s.with_attr("pos", "noun"))?;
+        corpus.add_document(doc)?;
+    }
+    let matches = corpus.find().with_text_folded("cafe");
+    assert_eq!(matches.count_values("words", "pos")?, [(Value::from("noun"), 2)]);
+    assert_eq!(corpus.find().count_spans(spans_in("words"))?, 2);
+    Ok(())
+}
 ```
+
+| Corpus final verb | Result |
+| :-- | :-- |
+| `get_selection()` | `Vec<(&str, Selection)>`: a document ID and its selection for each document with a hit. |
+| `get_passages()` | `Vec<(&str, Passage)>`: a document ID and passage for each hit range. |
+| `get_spans(f)` | `Vec<CorpusSpan>`: each matching span with its document ID and layer ID. |
+| `count()` / `count_spans(f)` | The sum of each selected document's hit count / matching span count. |
+| `count_values(layer, key)` | Counts spanning all selected documents; each span contributes once per equal value, even if it touches multiple hits. Sorted by descending count, then value order as in document queries. |
+
+Materialized results follow ascending document ID order, then the document query's usual order. Returned IDs borrow
+from the corpus; the selection, passage, or span data is owned. To load exactly one passage from a specific document,
+look it up with `document(id)` and use that document's `get_passage`.
+
+`CorpusError::UnknownDocument` reports an invalid explicit ID. `CorpusError::Query { document, error }` identifies
+which selected document failed. Required layers must exist in each document that uses them; they are not silently
+skipped. Passage source errors remain attached to their individual passages as with document queries. With no
+eligible documents, results are empty and counts are zero.
 
 ## Source layers
 
@@ -470,8 +520,9 @@ impl SpanSource for Highlights {
 ```
 
 - `SpanSource` requires `Send + Sync`.
-- Source spans must have IDs. They may target stored spans; a source span whose target doesn't exist is skipped.
+- Source spans without IDs are skipped. They may target stored spans; spans with missing targets are also skipped.
 - When a source fails while a passage is built, the passage still loads, and `p.error(layer)` reports it.
+  Invalid source ranges can still fail passage construction with `OutOfRange` or `NotCharBoundary`.
 
 ## Errors
 
@@ -631,26 +682,28 @@ bible.find().in_span("books", "GEN").in_layer("highlights").expand_to("verses").
   slot. Each slot also caches the span's resolved ranges, so reading never walks target chains.
 - **Targets.** A reverse map from each span to the spans that target it. `replace_span` uses it to update the cached
   ranges of every span downstream; `remove_span` uses it to cascade.
-- **Position index.** Per layer, an index answering "which slots touch this range" in O(log n + k), such as spans
-  sorted by start with a running maximum end. Rebuild it lazily after edits, on the first read, so building a
-  document with many `add_span` calls sorts once.
-- **Attribute index.** Per layer, each distinct string value is stored once and given a `u32`. For each key, a map
-  from value to the sorted list of slots that have it, and for numeric values, the slots sorted by value so a range
-  filter is a binary search. Filters intersect these slot lists before touching span data. Built lazily like the
-  position index.
-- **Folded text.** The folded copy of the text and its map back to original positions are built on the first
-  `with_text_folded` and extended on later pushes.
+- **Position index.** A balanced interval index sorted by start, with each subtree's maximum end. It is rebuilt lazily
+  after span edits on the next lookup. Each resolved range gets an entry, and lookups deduplicate matching slots.
+- **Attribute index.** A lazy per-layer map from attribute keys and exact values to matching slots. One indexed exact
+  predicate can narrow the candidates; remaining predicates run against the spans themselves. A range predicate on its
+  own scans candidates; there is no numeric-range index.
+- **Folded text.** Searches stream folded characters and keep only a pattern-sized window of original offsets.
+  ASCII bypasses normalization, and non-ASCII characters use a stack buffer. There is no cache across queries.
+- **Corpus.** A `BTreeMap` indexes documents by ID. Queries run serially through the document API; there is no global
+  text or attribute index. Value counts share one accumulator across documents and scan matching spans without cloning
+  stored spans. The accumulator uses a small list for few distinct values and switches to keyed lookup as it grows.
 
 ### Queries
 
-A query collects its steps, then runs them when the final verb is called. Each run of steps between `expand_to`
-steps is planned together: estimate each step's cost from index sizes, evaluate the cheapest first, and pass the
-narrowed hits to the rest. Text search runs only inside the current hits.
+A query collects its steps and runs them at the final verb. Between expansions, the planner applies eligible selection
+work in cost order, preserving point-sensitive and unknown selectors as boundaries. Text steps run in builder order
+on narrowed hits. Proximity filters run last in estimated cost order. Corpus queries do not change these rules.
 
 ### Dependencies
 
-`unicode-normalization` for NFC and NFD, `unicode-properties` (or equivalent) for general categories and
-`White_Space`, and `memchr` for substring search. Add others only when they replace substantial code.
+`unicode-normalization` supplies NFC, NFD, and mark classification; `unicode-general-category` supplies punctuation
+classification. Whitespace uses `char::is_whitespace`, and literal search uses `str::match_indices`. The library uses
+`alloc` and can be built without the default `std` feature.
 
 ### Performance targets
 
@@ -669,11 +722,28 @@ current laptop:
 | `with_text_folded` of a three-word phrase over the Bible               | < 30 ms   |
 | Resident memory with the Bible loaded                                  | < 400 MB  |
 
+The [full-workload benchmark](benches/README.md#full-bible-workload) matches these annotation counts in one synthetic
+document, with an in-memory source for highlights. It measures every target, separating cold and warm index use where
+applicable. The real BSB fixture and the synthetic multi-document corpus are separate benchmarks.
+On the default build, Strong’s counts and folded search meet their targets; resident memory and reverse lookup
+remain above budget.
+
+### Variances for review
+
+| Earlier design or sketch | Current implementation |
+| :-- | :-- |
+| A corpus could own shared stored/source layers and cross-document links, and accept document-qualified offsets or span refs directly. | Only documents own layers. Corpus queries apply document-local selectors to each selected document and attach IDs to results. There is no `Span::link`, `SpanRef::in_doc`, built-in persistence, or anchoring. |
+| Corpus metadata filters used a dedicated `docs()` selector. | `in_documents` selects IDs and `filter_documents` accepts a predicate on `&Document`. |
+| Attribute lookup interned strings, intersected multiple indexed conditions, and binary-searched numeric ranges. | Exact-value indexes hold string keys and narrow by one exact predicate. String values are still stored on spans. Range predicates test values as `f64`, which can round large integers. |
+| Folded text would be cached and extended on append, with only `Mn` marks ignored. | Searches refold the hits on every call and ignore all Unicode marks. They lowercase each character rather than applying full Unicode case folding. Literal and folded matching also differ in handling overlapping candidates. |
+| Literal search would use `memchr` directly. | It uses `str::match_indices`; `memchr` is not a direct library dependency. |
+| Concurrent readers were described as only needing coordination with writers. | `Document` and `Corpus` are not `Sync` because lazy layer indexes use `RefCell`. Passages are `Send + Sync`. |
+
 ## Open questions
 
 1. **What `followed_by` returns.** It keeps the first part of a pair. Should there be a way to get both parts as one
    hit?
 2. **Letters and their marks.** Ranges must start and end on character boundaries. Should a range also be kept from
    separating a letter from the combining marks after it?
-3. **Concurrent edits.** Editing takes `&mut Document`, so reading on one thread while editing on another needs a
-   lock. Should an edit instead produce a cheap new snapshot while readers keep the old one?
+3. **Concurrent access.** Should documents support simultaneous readers, and should edits produce cheap snapshots
+   so those readers can retain an older version?

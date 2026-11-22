@@ -116,6 +116,29 @@ fn with_text_folded_ignores_case_and_combining_marks() {
 }
 
 #[test]
+fn folded_search_keeps_overlaps_and_never_matches_across_hits() {
+    let mut doc = Document::new("folding");
+    doc.push("xÁbábA! ab ab").unwrap();
+
+    // Two overlapping matches normalize to their union.
+    assert_eq!(hits(doc.find().with_text_folded("aba")), [1..8]);
+    // Neither "ab" range contains "abab"; the matcher resets between ranges.
+    assert!(hits(doc.find().within([10..12, 13..15]).with_text_folded("abab")).is_empty());
+    assert!(hits(doc.find().with_text_folded("\u{0301}")).is_empty());
+}
+
+#[test]
+fn folded_search_maps_decomposition_matches_and_ignored_marks_to_original_bytes() {
+    let mut doc = Document::new("folding");
+    doc.push("x각a\u{20dd}B").unwrap();
+
+    // A last-component match still covers the entire Hangul syllable.
+    assert_eq!(hits(doc.find().with_text_folded("\u{11a8}")), [1..4]);
+    assert_eq!(hits(doc.find().with_text_folded("ab")), [4..9]);
+    assert_eq!(hits(doc.find().with_text_folded("a")), [4..5]);
+}
+
+#[test]
 fn followed_by_and_preceded_by_keep_hits_with_a_neighbour_within_the_distance() {
     let doc = genesis();
 
@@ -385,6 +408,46 @@ fn count_values_orders_ties_null_then_bools_then_numbers_then_strings() {
             (Value::from("B"), 1),
             (Value::from("a"), 1),
         ]
+    );
+}
+
+#[test]
+fn count_values_preserves_exact_numeric_equality_and_the_first_representation() {
+    let mut doc = Document::new("values").with_layer("x");
+    doc.push("x").unwrap();
+    let exact = 1_i64 << 53;
+    let nan = f64::NAN;
+    for values in [
+        vec![Value::Float(-0.0), Value::Int(0), Value::Float(0.0)],
+        // Promote the accumulator before seeing the next representation of zero.
+        ["a", "b", "c", "d", "e", "f", "g", "h"]
+            .map(Value::from)
+            .to_vec(),
+        vec![Value::Int(0)],
+        vec![Value::Int(exact + 1)],
+        vec![Value::Float(exact as f64), Value::Int(exact)],
+        vec![Value::Int(exact)],
+        vec![Value::Int(i64::MAX), Value::Float(i64::MAX as f64)],
+        vec![Value::Float(nan), Value::Float(nan)],
+    ] {
+        doc.add_span("x", Span::from(0..1).with_attr("v", values))
+            .unwrap();
+    }
+    let counts = doc.find().count_values("x", "v").unwrap();
+    assert_eq!(counts.len(), 15);
+    assert!(matches!(counts[0], (Value::Float(n), 2) if n.to_bits() == (-0.0_f64).to_bits()));
+    assert!(matches!(counts[1], (Value::Float(n), 2) if n == exact as f64));
+    assert!(counts.contains(&(Value::Int(exact + 1), 1)));
+    assert!(counts.contains(&(Value::Int(i64::MAX), 1)));
+    assert!(counts.contains(&(Value::Float(i64::MAX as f64), 1)));
+    assert_eq!(
+        counts
+            .iter()
+            .filter(|(value, count)| {
+                *count == 1 && matches!(value, Value::Float(n) if n.is_nan())
+            })
+            .count(),
+        2
     );
 }
 

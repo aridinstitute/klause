@@ -1,9 +1,9 @@
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-    vec::Vec,
-};
+#[cfg(not(feature = "std"))]
+use alloc::collections::BTreeMap as CountMap;
+use alloc::{boxed::Box, string::String, vec::Vec};
 use core::{cmp::Ordering, ops::Range};
+#[cfg(feature = "std")]
+use std::collections::HashMap as CountMap;
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
@@ -105,7 +105,7 @@ impl<'a> Query<'a> {
         self.push(Step::WithText(text.into(), false))
     }
 
-    /// Finds occurrences within the current hit ranges, ignoring case and nonspacing combining marks.
+    /// Finds occurrences within the current hit ranges, using Unicode lowercase and ignoring combining marks.
     pub fn with_text_folded(self, text: &str) -> Self {
         self.push(Step::WithText(text.into(), true))
     }
@@ -252,10 +252,18 @@ impl<'a> Query<'a> {
 
     /// Returns spans that match the filter and touch at least one hit.
     pub fn get_spans(self, filter: impl Into<SpanFilter>) -> Result<Vec<Span>, Error> {
+        Ok(self
+            .matched_spans(&filter.into())?
+            .into_iter()
+            .map(|matched| matched.span)
+            .collect())
+    }
+
+    pub(crate) fn matched_spans(self, filter: &SpanFilter) -> Result<Vec<MatchedSpan>, Error> {
         let doc = self.doc;
         let hits = Self::execute(doc, self.steps)?;
         let mut spans: Vec<MatchedSpan> = doc
-            .matching_spans(&filter.into())?
+            .matching_spans(filter)?
             .into_iter()
             .filter(|span| span_ranges_touch(&span.ranges, &hits))
             .collect();
@@ -265,7 +273,7 @@ impl<'a> Query<'a> {
                 span.layer_index,
             )
         });
-        Ok(spans.into_iter().map(|span| span.span).collect())
+        Ok(spans)
     }
 
     /// Returns the number of matching text ranges.
@@ -275,42 +283,133 @@ impl<'a> Query<'a> {
 
     /// Counts spans that match the filter and touch at least one hit.
     pub fn count_spans(self, filter: impl Into<SpanFilter>) -> Result<usize, Error> {
+        self.count_spans_matching(&filter.into())
+    }
+
+    pub(crate) fn count_spans_matching(self, filter: &SpanFilter) -> Result<usize, Error> {
         let doc = self.doc;
         let hits = Self::execute(doc, self.steps)?;
-        doc.count_matching_spans_touching(&filter.into(), &hits)
+        doc.count_matching_spans_touching(filter, &hits)
     }
 
     /// Counts how many spans touching a hit have each value for the given layer and key.
     /// Returns the most frequent values first.
     pub fn count_values(self, layer: &str, key: &str) -> Result<Vec<(Value, usize)>, Error> {
+        let mut counts = ValueCounts::default();
+        self.count_values_into(layer, key, &mut counts)?;
+        Ok(counts.finish())
+    }
+
+    pub(crate) fn count_values_into(
+        self,
+        layer: &str,
+        key: &str,
+        counts: &mut ValueCounts,
+    ) -> Result<(), Error> {
         let doc = self.doc;
         let hits = Self::execute(doc, self.steps)?;
-        let spans = doc.matching_spans(&spans_in(layer))?;
-        let mut counts: Vec<(Value, usize)> = Vec::new();
-
-        for matched in spans
-            .iter()
-            .filter(|span| span_ranges_touch(&span.ranges, &hits))
-        {
-            let mut seen = Vec::new();
-            for value in matched.span.values(key) {
-                if seen.contains(&value) {
+        doc.visit_layer_spans_touching(layer, &hits, |span| {
+            for (index, value) in span.values(key).enumerate() {
+                if index != 0 && span.values(key).take(index).any(|seen| seen == value) {
                     continue;
                 }
-                seen.push(value);
-                if let Some(index) = counts.iter().position(|(previous, _)| previous == value) {
-                    counts[index].1 += 1;
-                } else {
-                    counts.push((value.clone(), 1));
+                counts.add(value);
+            }
+        })
+    }
+}
+
+// Keep the first observed representation and retain insertion order for equal sort keys.
+#[derive(Default)]
+pub(crate) struct ValueCounts {
+    counts: Vec<(Value, usize)>,
+    keys: Option<ValueCountKeys>,
+}
+
+#[derive(Default)]
+struct ValueCountKeys {
+    strings: CountMap<String, usize>,
+    scalars: CountMap<ScalarKey, usize>,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ScalarKey {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(u64),
+}
+
+impl ValueCountKeys {
+    fn index_or_insert(&mut self, value: &Value, next: usize) -> usize {
+        match value {
+            Value::Str(text) => match self.strings.get(text.as_str()) {
+                Some(&index) => index,
+                None => {
+                    self.strings.insert(text.clone(), next);
+                    next
                 }
+            },
+            // NaN is not equal to itself: every occurrence is a separate count.
+            Value::Float(n) if n.is_nan() => next,
+            value => {
+                let key = match *value {
+                    Value::Null => ScalarKey::Null,
+                    Value::Bool(b) => ScalarKey::Bool(b),
+                    Value::Int(n) => ScalarKey::Int(n),
+                    // Match Value equality: only exactly representable integers
+                    // group with floats. Both signs of zero group with Int(0).
+                    Value::Float(n) => {
+                        let integer = n as i64;
+                        if n >= i64::MIN as f64 && n < -(i64::MIN as f64) && integer as f64 == n {
+                            ScalarKey::Int(integer)
+                        } else {
+                            ScalarKey::Float(n.to_bits())
+                        }
+                    }
+                    Value::Str(_) => unreachable!(),
+                };
+                *self.scalars.entry(key).or_insert(next)
             }
         }
-        counts.sort_by(|(left, left_count), (right, right_count)| {
-            right_count
-                .cmp(left_count)
-                .then_with(|| compare_values(left, right))
-        });
-        Ok(counts)
+    }
+}
+
+impl ValueCounts {
+    fn add(&mut self, value: &Value) {
+        const SMALL_LIMIT: usize = 8;
+        let next = self.counts.len();
+        let index = match &mut self.keys {
+            Some(keys) => keys.index_or_insert(value, next),
+            None => self
+                .counts
+                .iter()
+                .position(|(previous, _)| previous == value)
+                .unwrap_or(next),
+        };
+        if index == next {
+            self.counts.push((value.clone(), 1));
+            // Avoid map setup and lookups for low-cardinality counts such as POS.
+            if self.keys.is_none() && self.counts.len() == SMALL_LIMIT {
+                let mut keys = ValueCountKeys::default();
+                for (index, (value, _)) in self.counts.iter().enumerate() {
+                    keys.index_or_insert(value, index);
+                }
+                self.keys = Some(keys);
+            }
+        } else {
+            self.counts[index].1 += 1;
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Vec<(Value, usize)> {
+        self.counts
+            .sort_by(|(left, left_count), (right, right_count)| {
+                right_count
+                    .cmp(left_count)
+                    .then_with(|| compare_values(left, right))
+            });
+        self.counts
     }
 }
 
@@ -328,48 +427,66 @@ fn find_text(doc: &Document, hits: &Selection, text: &str) -> Selection {
     Selection::from_ranges(ranges)
 }
 
-fn fold(input: &str, base: u32) -> Vec<(char, Range<u32>)> {
-    let mut folded = Vec::new();
-    for (offset, character) in input.char_indices() {
-        let start = base + offset as u32;
-        let end = start + character.len_utf8() as u32;
-        let source = character.to_string();
+// Fold each source character separately so every emitted character keeps its
+// original byte range, even when a single source character expands into several.
+fn fold(input: &str, mut emit: impl FnMut(char, usize, usize)) {
+    for (start, character) in input.char_indices() {
+        if character.is_ascii() {
+            emit(character.to_ascii_lowercase(), start, start + 1);
+            continue;
+        }
+        let mut buffer = [0; 4];
+        let source = character.encode_utf8(&mut buffer);
+        let end = start + source.len();
         for decomposed in source.nfd() {
             if !is_combining_mark(decomposed) {
                 for lower in decomposed.to_lowercase() {
-                    folded.push((lower, start..end));
+                    emit(lower, start, end);
                 }
             }
         }
     }
-    folded
 }
 
 fn find_text_folded(doc: &Document, hits: &Selection, text: &str) -> Selection {
-    let pattern: Vec<char> = fold(text, 0)
-        .into_iter()
-        .map(|(character, _)| character)
-        .collect();
+    let mut pattern = Vec::new();
+    fold(text, |ch, _, _| pattern.push(ch));
     if pattern.is_empty() {
         return Selection::from_ranges(Vec::new());
     }
+
+    // KMP finds overlapping matches in a single pass. The ring only keeps
+    // enough source offsets to recover the start of a complete match.
+    let mut prefix = alloc::vec![0; pattern.len()];
+    for i in 1..pattern.len() {
+        prefix[i] = advance_match(&pattern, &prefix, prefix[i - 1], pattern[i]);
+    }
+    let mut starts = alloc::vec![0; pattern.len()];
     let mut ranges = Vec::new();
     for hit in hits.ranges() {
-        let folded = fold(doc.slice(hit.clone()), hit.start);
-        if pattern.len() > folded.len() {
-            continue;
-        }
-        for start in 0..=folded.len() - pattern.len() {
-            if folded[start..start + pattern.len()]
-                .iter()
-                .map(|(character, _)| *character)
-                .eq(pattern.iter().copied())
-            {
-                ranges.push(folded[start].1.start..folded[start + pattern.len() - 1].1.end);
+        let (mut matched, mut slot) = (0, 0);
+        fold(doc.slice(hit.clone()), |ch, start, end| {
+            starts[slot] = start as u32;
+            slot += 1;
+            if slot == starts.len() {
+                slot = 0;
             }
-        }
+            matched = advance_match(&pattern, &prefix, matched, ch);
+            if matched == pattern.len() {
+                ranges.push(hit.start + starts[slot]..hit.start + end as u32);
+                matched = prefix[matched - 1];
+            }
+        });
     }
     Selection::from_ranges(ranges)
+}
+
+// matched is always a proper prefix, so pattern[matched] exists.
+fn advance_match(pattern: &[char], prefix: &[usize], mut matched: usize, ch: char) -> usize {
+    while matched > 0 && ch != pattern[matched] {
+        matched = prefix[matched - 1];
+    }
+    matched + usize::from(ch == pattern[matched])
 }
 
 fn matching_neighbours(
@@ -560,7 +677,7 @@ impl Distance {
         }
     }
 
-    /// At most `n` spans of `layer` lie wholly in between.
+    /// At most `n` distinct spans of `layer` have a range wholly in between.
     pub fn at_most(n: usize, layer: impl Into<String>) -> Self {
         Self {
             kind: DistanceKind::AtMost(n, layer.into()),

@@ -183,7 +183,7 @@ impl Layer {
     /// # impl SpanSource for EnmityHighlight {
     /// #     fn get_spans(&self, range: std::ops::Range<u32>) -> Result<Vec<Span>, SourceError> {
     /// #         Ok(if range.start < 21 && 15 < range.end {
-    /// #             vec![Span::from(15..21).with_attr("topic", "enmity")]
+    /// #             vec![Span::from(15..21).with_id("highlight").with_attr("topic", "enmity")]
     /// #         } else {
     /// #             Vec::new()
     /// #         })
@@ -272,7 +272,7 @@ impl Layer {
     /// # impl SpanSource for EnmityHighlight {
     /// #     fn get_spans(&self, range: std::ops::Range<u32>) -> Result<Vec<Span>, SourceError> {
     /// #         Ok(if range.start < 21 && 15 < range.end {
-    /// #             vec![Span::from(15..21).with_attr("topic", "enmity")]
+    /// #             vec![Span::from(15..21).with_id("highlight").with_attr("topic", "enmity")]
     /// #         } else {
     /// #             Vec::new()
     /// #         })

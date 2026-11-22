@@ -1,69 +1,129 @@
 # Klause
 
-[![Crates.io](https://img.shields.io/crates/v/klause.svg)](https://crates.io/crates/klause)
-[![Docs.rs](https://docs.rs/klause/badge.svg)](https://docs.rs/klause)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
-Klause is a document data model designed for efficient text extraction, annotation, and searching.
-
-## Overview
-
-Klause is a Rust library that makes working with annotated documents easy. The API is designed to be
-easy to learn and use, and the data model is very flexible, allowing annotation and querying of documents
-such as ancient texts, the Bible, and more.
-
-- **Flexible Data Model** — Text is annotated by spans and attributes, allowing lots of flexibility in data storage.
-- **Plain-Text Model** — Plain, unannotated text is stored as its own property, allowing tradition text querying using tools like regex.
-- **Speed** — Klause is designed to filter and aggregate as fast as possible.
+Klause is a Rust library for storing, reading, and querying annotated text.
+Use a `Document` for one text or a `Corpus` to search and aggregate across several.
+Klause keeps text and stored annotations in memory; file and database I/O belong to your application.
 
 ## Definitions
 
-- **Document** — An ID, attributes, and a text that only ever grows, plus the stored layers of spans annotated on it.
-- **Span** — One annotation in a layer: a target (text ranges, a point, another span, or a link), attributes, and an ID.
-- **Layer** — A named set of spans. Stored layers live in the document; source layers are read live from your own storage.
-- **Value** — An attribute value: null, bool, integer, float, string, or a list of those.
+- **Document** — An ID, metadata, append-only UTF-8 text, and named annotation layers. Positions are document-local byte offsets into NFC-normalized text.
+- **Corpus** — Documents with unique IDs; queries run independently on the selected documents and can aggregate the results.
+- **Span** — An annotation with an ID, attributes, and a target: one or more text ranges (including points), or another span in the same document.
+- **Layer** — A named group of spans. A stored layer owns its spans; a source layer reads them live from application storage.
+- **Value** — A scalar: null, bool, integer, float, or string. An attribute key can hold multiple values.
 - **Selection** — A sorted set of text ranges that can be unioned, intersected, and subtracted.
-- **Passage** — A range of text with every span that touches it, ready to render.
-- **Query** — A fluent builder that filters text and returns a selection, passages, spans, or counts.
-- **Corpus** — Several documents, for queries across them, links between them, and layers they share.
-- **Anchor** — A checksum, quote, and surrounding context that finds a stored span again in a new edition.
+- **Passage** — A range of text and the spans that touch it in the included layers.
+- **Query** — A builder that narrows or expands hits and returns selections, passages, spans, or counts.
 
 ## Installation
 
-Add Klause to your `Cargo.toml`:
+Klause is not published on crates.io yet. Add it as a Git dependency:
 
 ```toml
 [dependencies]
-klause = "0.1.0"
+klause = { git = "https://github.com/aridinstitute/klause" }
 ```
 
-Or with [cargo-add](https://github.com/rust-lang/cargo):
-
-```sh
-cargo add klause
-```
+For reproducible builds, pin a commit with `rev`. Disable default features
+to build Klause with `alloc` and without `std`.
 
 ## Usage
 
 ```rust
-use klause::Document;
+use klause::{Document, spans_in};
 
-fn main() {
-    let klause = Klause::new();
-    println!("{klause:?}");
+fn main() -> Result<(), klause::Error> {
+    let mut doc = Document::new("greeting").with_layer("words");
+    doc.push("Hello, ")?;
+    doc.push_span("words", "world", |span| span.with_attr("pos", "noun"))?;
+    doc.push("!")?;
+
+    let passage = doc
+        .find()
+        .within(spans_in("words").with_attr("pos", "noun"))
+        .get_passage()?;
+    assert_eq!(passage.text(), "world");
+    Ok(())
 }
 ```
 
-For more examples, see the [`examples/`](./examples) directory and the
-[API documentation](https://docs.rs/klause).
+Use `get_passage` to render text with its annotations, `get_spans` to
+retrieve matching annotations, or `count_spans` and `count_values` to aggregate.
+Passages own their annotation data and can outlive the document borrow. To load
+application-managed annotations on demand, add a source layer with
+`Layer::source` and implement `SpanSource`.
+
+### Querying multiple documents
+
+```rust
+use klause::{Corpus, Document, Value};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut corpus = Corpus::new();
+    for (id, text) in [("fr", "Café"), ("en", "cafe")] {
+        let mut doc = Document::new(id).with_layer("words");
+        doc.push_span("words", text, |span| span.with_attr("pos", "noun"))?;
+        corpus.add_document(doc)?;
+    }
+
+    let counts = corpus.find().with_text_folded("cafe").count_values("words", "pos")?;
+    assert_eq!(counts, [(Value::from("noun"), 2)]);
+    Ok(())
+}
+```
+
+Use `in_documents` to select IDs or `filter_documents` to select by metadata or
+layer availability. A required layer missing from a selected document is an
+error that names the document. Selection, passage, and span results retain their
+document IDs. Text matches, offsets, and span targets never cross document
+boundaries. Corpus-wide annotation layers, cross-document links, and built-in
+persistence are not implemented.
+
+Run the [quickstart](examples/quickstart.rs) or [corpus example](examples/corpus.rs)
+with `cargo run --example quickstart` or `cargo run --example corpus`. See the
+[design](DESIGN.md) for semantics, or run `cargo doc --no-deps --open` for the API reference.
+
+## Tests and benchmarks
+
+```sh
+cargo test
+cargo check --no-default-features
+cargo bench --bench bible_workload
+cargo bench --bench bible_workload -- --rss
+```
+
+The [benchmark notes](benches/README.md) cover the full synthetic Bible workload,
+including cold and warm queries, folded search, and resident memory. The
+[corpus benchmarks](benches/README.md#cross-document-corpus) measure queries
+across up to 66 synthetic documents.
+
+### Real Bible fixture
+
+The 66-book [Berean Standard Bible USJ fixture](tests/fixtures/bsb_usj/) is used
+by both the integration test and the Criterion benchmark:
+
+```sh
+cargo test --test bsb_usj -- --nocapture
+cargo bench --bench bsb_usj
+```
+
+The test-only loader builds one `Document` with book, chapter, verse, word,
+structure, and footnote layers. It indexes verse text, leaving editorial headings
+and footnote bodies out of the searchable text. The benchmark measures loading
+and conversion, word and verse filters, and folded phrase search separately
+from verse materialization.
+
+The Berean Standard Bible text is [dedicated to the public domain](https://berean.bible/terms.htm).
 
 ## Minimum supported Rust version (MSRV)
 
-Klause requires Rust 1.85 or newer.
+Klause requires Rust 1.88 or newer.
 
 ## Contributing
 
-I'm not currently accepting contributions, but feel free to make an issue if you want a feature or find a bug!
+Bug reports and feature requests are welcome in [GitHub Issues](https://github.com/aridinstitute/klause/issues).
 
 ## License
 
