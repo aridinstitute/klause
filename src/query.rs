@@ -1,4 +1,5 @@
 use alloc::{
+    boxed::Box,
     string::{String, ToString},
     vec::Vec,
 };
@@ -6,13 +7,44 @@ use core::{cmp::Ordering, ops::Range};
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
-use crate::document::{Document, Error, MatchedSpan, Span, SpanId, Value};
+use crate::document::{Document, Error, MatchedSpan, Span, SpanId, Value, span_ranges_touch};
 use crate::passage::Passage;
 use crate::selection::{IntoSelection, Selection, SpanFilter, span_id, spans_in};
 
-enum Step {
-    Within(Result<Selection, Error>),
-    Outside(Result<Selection, Error>),
+trait PlannedSelection {
+    fn estimate_cost(&self, doc: &Document) -> usize;
+    fn may_select_points(&self, doc: &Document) -> bool;
+    fn resolve(
+        self: Box<Self>,
+        doc: &Document,
+        hits: Option<&Selection>,
+    ) -> Result<Selection, Error>;
+}
+
+impl<T: IntoSelection> PlannedSelection for T {
+    fn may_select_points(&self, doc: &Document) -> bool {
+        IntoSelection::may_select_points(self, doc)
+    }
+
+    fn estimate_cost(&self, doc: &Document) -> usize {
+        IntoSelection::estimate_cost(self, doc)
+    }
+
+    fn resolve(
+        self: Box<Self>,
+        doc: &Document,
+        hits: Option<&Selection>,
+    ) -> Result<Selection, Error> {
+        match hits {
+            Some(hits) => (*self).into_selection_within(doc, hits),
+            None => (*self).into_selection(doc),
+        }
+    }
+}
+
+enum Step<'a> {
+    Within(Box<dyn PlannedSelection + 'a>),
+    Outside(Box<dyn PlannedSelection + 'a>),
     WithText(String, bool),
     FollowedBy(SpanFilter, Distance),
     PrecededBy(SpanFilter, Distance),
@@ -21,9 +53,16 @@ enum Step {
 
 /// A document query that starts with the whole text and applies steps to narrow or widen the match ranges.
 /// The steps run when a result is requested, for example with [`Query::get_selection`].
+///
+/// Between `expand_to` steps, selections narrow the search area first, followed
+/// by text searches, then proximity filters. Selection work is ordered by
+/// estimated index sizes, so a layer restriction applies even when it is
+/// written after a text search. Text searches retain their relative order.
+/// Selection steps that may contain points retain their place among the other
+/// selection steps because inclusive point boundaries are order-sensitive.
 pub struct Query<'a> {
     doc: &'a Document,
-    steps: Vec<Step>,
+    steps: Vec<Step<'a>>,
     layers: Option<Vec<String>>,
 }
 
@@ -36,21 +75,19 @@ impl<'a> Query<'a> {
         }
     }
 
-    fn push(mut self, step: Step) -> Self {
+    fn push(mut self, step: Step<'a>) -> Self {
         self.steps.push(step);
         self
     }
 
     /// Keeps only the portions of the current hits within the given selection.
     pub fn within(self, selection: impl IntoSelection + 'a) -> Self {
-        let result = selection.into_selection(self.doc);
-        self.push(Step::Within(result))
+        self.push(Step::Within(Box::new(selection)))
     }
 
     /// Removes the portions of the current hits within the given selection.
     pub fn outside(self, selection: impl IntoSelection + 'a) -> Self {
-        let result = selection.into_selection(self.doc);
-        self.push(Step::Outside(result))
+        self.push(Step::Outside(Box::new(selection)))
     }
 
     /// Keeps only the portions of the current hits covered by spans in the given layer.
@@ -98,12 +135,64 @@ impl<'a> Query<'a> {
         self
     }
 
-    fn execute(doc: &Document, steps: Vec<Step>) -> Result<Selection, Error> {
+    fn execute(doc: &Document, mut steps: Vec<Step<'a>>) -> Result<Selection, Error> {
+        let mut start = 0;
+        for end in 0..=steps.len() {
+            if end == steps.len() || matches!(steps[end], Step::ExpandTo(_)) {
+                // Stable sorting preserves the order of text transformations.
+                // Expansions are never moved across their surrounding steps.
+                let block = &mut steps[start..end];
+                block.sort_by_key(|step| match step {
+                    Step::Within(_) | Step::Outside(_) => (0, 0),
+                    Step::WithText(_, _) => (1, 0),
+                    Step::FollowedBy(filter, distance) | Step::PrecededBy(filter, distance) => {
+                        let intervening = match &distance.kind {
+                            DistanceKind::AtMost(_, layer) => {
+                                doc.estimate_filter_cost(&spans_in(layer))
+                            }
+                            _ => 0,
+                        };
+                        (
+                            2,
+                            doc.estimate_filter_cost(filter).saturating_add(intervening),
+                        )
+                    }
+                    Step::ExpandTo(_) => unreachable!(),
+                });
+                let restrictions = block
+                    .iter()
+                    .position(|step| !matches!(step, Step::Within(_) | Step::Outside(_)))
+                    .unwrap_or(block.len());
+                let mut run_start = 0;
+                for run_end in 0..=restrictions {
+                    let boundary = run_end == restrictions
+                        || match &block[run_end] {
+                            Step::Within(selection) | Step::Outside(selection) => {
+                                selection.may_select_points(doc)
+                            }
+                            _ => unreachable!(),
+                        };
+                    if boundary {
+                        // Inclusive point boundaries make selection algebra
+                        // order-sensitive. Never sort across a possible point
+                        // selector or an unknown custom/source selector.
+                        block[run_start..run_end].sort_by_key(|step| match step {
+                            Step::Within(selection) | Step::Outside(selection) => {
+                                selection.estimate_cost(doc)
+                            }
+                            _ => unreachable!(),
+                        });
+                        run_start = run_end + 1;
+                    }
+                }
+                start = end + 1;
+            }
+        }
         let mut hits = Selection::from_ranges(alloc::vec![0..doc.len()]);
         for step in steps {
             hits = match step {
-                Step::Within(selection) => hits.intersect(&selection?),
-                Step::Outside(selection) => hits.subtract(&selection?),
+                Step::Within(selection) => selection.resolve(doc, Some(&hits))?,
+                Step::Outside(selection) => hits.subtract(&selection.resolve(doc, None)?),
                 Step::WithText(text, folded) => {
                     if folded {
                         find_text_folded(doc, &hits, &text)
@@ -112,22 +201,18 @@ impl<'a> Query<'a> {
                     }
                 }
                 Step::FollowedBy(filter, distance) => {
-                    let spans = doc.matching_spans(&filter)?;
-                    let intervening = intervening_spans(doc, &distance)?;
-                    matching_neighbours(doc, &hits, &spans, &distance, &intervening, true)
+                    matching_neighbours(doc, hits, &filter, &distance, true)?
                 }
                 Step::PrecededBy(filter, distance) => {
-                    let spans = doc.matching_spans(&filter)?;
-                    let intervening = intervening_spans(doc, &distance)?;
-                    matching_neighbours(doc, &hits, &spans, &distance, &intervening, false)
+                    matching_neighbours(doc, hits, &filter, &distance, false)?
                 }
                 Step::ExpandTo(filter) => {
-                    let spans = doc.matching_spans(&filter)?;
-                    let ranges = spans
-                        .into_iter()
-                        .filter(|span| span_touches_hits(&span.ranges, &hits))
-                        .flat_map(|span| span.ranges)
-                        .collect();
+                    let mut ranges = Vec::new();
+                    doc.visit_matching_ranges(&filter, |matched| {
+                        if span_ranges_touch(matched, &hits) {
+                            ranges.extend_from_slice(matched);
+                        }
+                    })?;
                     Selection::from_ranges(ranges)
                 }
             };
@@ -172,7 +257,7 @@ impl<'a> Query<'a> {
         let mut spans: Vec<MatchedSpan> = doc
             .matching_spans(&filter.into())?
             .into_iter()
-            .filter(|span| span_touches_hits(&span.ranges, &hits))
+            .filter(|span| span_ranges_touch(&span.ranges, &hits))
             .collect();
         spans.sort_by_key(|span| {
             (
@@ -205,7 +290,7 @@ impl<'a> Query<'a> {
 
         for matched in spans
             .iter()
-            .filter(|span| span_touches_hits(&span.ranges, &hits))
+            .filter(|span| span_ranges_touch(&span.ranges, &hits))
         {
             let mut seen = Vec::new();
             for value in matched.span.values(key) {
@@ -287,88 +372,138 @@ fn find_text_folded(doc: &Document, hits: &Selection, text: &str) -> Selection {
     Selection::from_ranges(ranges)
 }
 
-fn span_touches_hits(ranges: &[Range<u32>], hits: &Selection) -> bool {
-    ranges.iter().any(|span| {
-        hits.ranges().iter().any(|hit| {
-            if span.start == span.end {
-                if hit.start == hit.end {
-                    span.start == hit.start
-                } else {
-                    hit.start <= span.start && span.start <= hit.end
-                }
-            } else if hit.start == hit.end {
-                false
-            } else {
-                span.start < hit.end && hit.start < span.end
-            }
-        })
-    })
-}
-
 fn matching_neighbours(
     doc: &Document,
-    hits: &Selection,
-    candidates: &[MatchedSpan],
+    mut hits: Selection,
+    filter: &SpanFilter,
     distance: &Distance,
-    intervening: &[MatchedSpan],
     follows: bool,
-) -> Selection {
-    let ranges = hits
-        .ranges()
-        .iter()
-        .filter(|hit| {
-            candidates.iter().any(|candidate| {
-                candidate.ranges.iter().any(|candidate_range| {
-                    let gap = if follows {
-                        if candidate_range.start < hit.end {
-                            return false;
-                        }
-                        hit.end..candidate_range.start
-                    } else {
-                        if candidate_range.end > hit.start {
-                            return false;
-                        }
-                        candidate_range.end..hit.start
-                    };
-                    within_distance(doc, &gap, distance, intervening)
-                })
-            })
-        })
-        .cloned()
-        .collect();
-    Selection::from_ranges(ranges)
-}
-
-fn within_distance(
-    doc: &Document,
-    gap: &Range<u32>,
-    distance: &Distance,
-    intervening: &[MatchedSpan],
-) -> bool {
-    match &distance.kind {
-        DistanceKind::Bytes(max) => gap.end - gap.start <= *max,
-        DistanceKind::Adjacent => doc
-            .slice(gap.clone())
-            .chars()
-            .all(|character| character.is_whitespace() || is_punctuation(character)),
-        DistanceKind::AtMost(max, _) => {
-            let count = intervening
-                .iter()
-                .filter(|span| {
-                    span.ranges
-                        .iter()
-                        .any(|range| range.start >= gap.start && range.end <= gap.end)
-                })
-                .count();
-            count <= *max
-        }
+) -> Result<Selection, Error> {
+    let mut neighbours = Vec::new();
+    doc.visit_matching_ranges(filter, |ranges| {
+        neighbours.extend(ranges.iter().map(|r| if follows { r.start } else { r.end }));
+    })?;
+    let mut intervening = match &distance.kind {
+        DistanceKind::AtMost(_, layer) => Some(SpanGapIndex::build(doc, layer)?),
+        _ => None,
+    };
+    // Even empty hits must resolve the filters above to preserve query errors.
+    if !neighbours.is_sorted() {
+        neighbours.sort_unstable();
     }
+    let mut cursor = 0;
+    hits.retain_ranges(|hit| {
+        // The closest eligible neighbour gives the smallest gap. If its gap
+        // fails, any farther neighbour's superset must also fail.
+        let gap = if follows {
+            while cursor < neighbours.len() && neighbours[cursor] < hit.end {
+                cursor += 1;
+            }
+            let Some(&start) = neighbours.get(cursor) else {
+                return false;
+            };
+            hit.end..start
+        } else {
+            while cursor < neighbours.len() && neighbours[cursor] <= hit.start {
+                cursor += 1;
+            }
+            if cursor == 0 {
+                return false;
+            }
+            neighbours[cursor - 1]..hit.start
+        };
+        match &distance.kind {
+            DistanceKind::Bytes(max) => gap.end - gap.start <= *max,
+            DistanceKind::Adjacent => doc
+                .slice(gap)
+                .chars()
+                .all(|ch| ch.is_whitespace() || is_punctuation(ch)),
+            DistanceKind::AtMost(max, _) => intervening.as_mut().unwrap().at_most(gap, *max),
+        }
+    });
+    Ok(hits)
 }
 
-fn intervening_spans(doc: &Document, distance: &Distance) -> Result<Vec<MatchedSpan>, Error> {
-    match &distance.kind {
-        DistanceKind::AtMost(_, layer) => doc.matching_spans(&spans_in(layer)),
-        DistanceKind::Bytes(_) | DistanceKind::Adjacent => Ok(Vec::new()),
+struct GapEntry {
+    range: Range<u32>,
+    span: usize,
+}
+
+struct SpanGapIndex {
+    entries: Vec<GapEntry>,
+    first: usize,
+    past_end: usize,
+    ordered_ends: bool,
+    // Present only if a span has multiple ranges and needs deduplication.
+    seen: Vec<usize>,
+    generation: usize,
+}
+
+impl SpanGapIndex {
+    fn build(doc: &Document, layer: &str) -> Result<Self, Error> {
+        let mut entries = Vec::new();
+        let mut span = 0;
+        let mut multi_range = false;
+        doc.visit_matching_ranges(&spans_in(layer), |ranges| {
+            multi_range |= ranges.len() > 1;
+            entries.extend(ranges.iter().cloned().map(|range| GapEntry { range, span }));
+            span += 1;
+        })?;
+        if !entries.is_sorted_by_key(|entry| entry.range.start) {
+            entries.sort_unstable_by_key(|entry| entry.range.start);
+        }
+        let ordered_ends = !multi_range && entries.is_sorted_by_key(|entry| entry.range.end);
+        Ok(Self {
+            entries,
+            first: 0,
+            past_end: 0,
+            ordered_ends,
+            seen: if multi_range {
+                alloc::vec![0; span]
+            } else {
+                Vec::new()
+            },
+            generation: 0,
+        })
+    }
+
+    fn at_most(&mut self, gap: Range<u32>, max: usize) -> bool {
+        // Both gap boundaries advance monotonically as hits advance.
+        while self.first < self.entries.len() && self.entries[self.first].range.start < gap.start {
+            self.first += 1;
+        }
+        if self.ordered_ends {
+            // When starts and ends share the same order and each span has one
+            // range, the contained spans are exactly a single slice.
+            self.past_end = self.past_end.max(self.first);
+            while self.past_end < self.entries.len()
+                && self.entries[self.past_end].range.end <= gap.end
+            {
+                self.past_end += 1;
+            }
+            return self.past_end - self.first <= max;
+        }
+
+        self.generation += 1;
+        let mut count = 0;
+        for entry in &self.entries[self.first..] {
+            if entry.range.start > gap.end {
+                break;
+            }
+            if entry.range.end <= gap.end {
+                if let Some(seen) = self.seen.get_mut(entry.span) {
+                    if *seen == self.generation {
+                        continue;
+                    }
+                    *seen = self.generation;
+                }
+                count += 1;
+                if count > max {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 

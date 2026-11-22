@@ -10,8 +10,10 @@ and performance targets.
 
 - [x] Add a lazy per-layer position index. Stored passage spans are looked up
   through a balanced interval index, rebuilt after span edits on the next lookup.
-- [ ] Add query planning. Steps currently execute in order, rather than
-  cheapest-first between `expand_to` steps.
+- [x] Add query planning. Between `expand_to` steps, selections run before text
+  searches and proximity filters. Cost estimates order selection work and choose
+  position or attribute lookups within narrowed hits. Text-search order and
+  point-sensitive selection boundaries are preserved; see `DESIGN.md`.
 - [ ] Cache folded text and its map back to original positions, extending the
   cache after pushes. Folded searches currently rebuild it on each call.
 - [ ] Extend attribute indexing to numeric ranges. Exact-value filtering is

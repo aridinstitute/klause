@@ -60,3 +60,7 @@ harness = false
 [[bench]]
 name = "filtering"
 harness = false
+
+[[bench]]
+name = "planning"
+harness = false

@@ -1,4 +1,4 @@
-use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use alloc::{borrow::Cow, string::String, sync::Arc, vec, vec::Vec};
 use core::{fmt, ops::Range};
 use unicode_normalization::UnicodeNormalization;
 
@@ -220,6 +220,7 @@ impl Document {
             }
         }
         span.id = Some(id.clone());
+        stored.point_span_count += usize::from(ranges.iter().any(Range::is_empty));
         let slot = if let Some(slot) = stored.free_slots.pop() {
             stored.spans[slot] = Some(span);
             stored.resolved_ranges[slot] = ranges;
@@ -284,6 +285,12 @@ impl Document {
         self.layers[layer].invalidate_attribute_index();
         let mut pending = vec![(layer, slot)];
         while let Some((layer, slot)) = pending.pop() {
+            self.layers[layer].point_span_count -= usize::from(
+                self.layers[layer].resolved_ranges[slot]
+                    .iter()
+                    .any(Range::is_empty),
+            );
+            self.layers[layer].point_span_count += usize::from(ranges.iter().any(Range::is_empty));
             self.layers[layer].resolved_ranges[slot].clone_from(&ranges);
             self.layers[layer].invalidate_position_index();
             if let Some(dependents) = self.layers[layer].dependents.get(slot) {
@@ -332,6 +339,8 @@ impl Document {
                     };
                 }
             }
+            stored.point_span_count -=
+                usize::from(stored.resolved_ranges[slot].iter().any(Range::is_empty));
             stored.resolved_ranges[slot].clear();
             stored.free_slots.push(slot);
         }
@@ -611,37 +620,108 @@ impl Document {
         ranges: Vec<Range<u32>>,
     ) -> Result<Selection, Error> {
         for range in &ranges {
-            if range.start > range.end || range.end > self.len() {
-                return Err(Error::OutOfRange(range.clone()));
-            }
-            for position in [range.start, range.end] {
-                if !self.text.is_char_boundary(position as usize) {
-                    return Err(Error::NotCharBoundary(position));
-                }
-            }
+            self.validate_range(range)?;
         }
         Ok(Selection::from_ranges(ranges))
     }
 
-    pub(crate) fn selection_for_filter(&self, filter: &SpanFilter) -> Result<Selection, Error> {
-        let ranges = self.matching_ranges(filter)?;
-        self.selection_from_ranges(ranges)
+    fn validate_range(&self, range: &Range<u32>) -> Result<(), Error> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(Error::OutOfRange(range.clone()));
+        }
+        for position in [range.start, range.end] {
+            if !self.text.is_char_boundary(position as usize) {
+                return Err(Error::NotCharBoundary(position));
+            }
+        }
+        Ok(())
     }
 
-    pub(crate) fn matching_ranges(&self, filter: &SpanFilter) -> Result<Vec<Range<u32>>, Error> {
-        let indices = self.matching_layer_indices(filter)?;
-        if indices.iter().any(|&index| self.layers[index].is_source()) {
-            return Ok(self
-                .matching_spans(filter)?
-                .into_iter()
-                .flat_map(|matched| matched.ranges)
-                .collect());
-        }
+    pub(crate) fn selection_for_filter(&self, filter: &SpanFilter) -> Result<Selection, Error> {
+        Ok(Selection::from_ranges(self.matching_ranges(filter)?))
+    }
 
+    pub(crate) fn estimate_filter_cost(&self, filter: &SpanFilter) -> usize {
+        self.layers
+            .iter()
+            .filter(|layer| {
+                filter
+                    .layer_ids()
+                    .is_none_or(|ids| ids.iter().any(|id| id == layer.id()))
+            })
+            .fold(0_usize, |cost, layer| {
+                let candidates = if layer.is_source() {
+                    // Sources have no local statistics. Do not read one to plan.
+                    self.len() as usize
+                } else if let Some((key, value)) = filter.index_hint() {
+                    layer.estimated_matching_count(key, value)
+                } else {
+                    layer.span_slots.len()
+                };
+                cost.saturating_add(candidates)
+            })
+    }
+
+    pub(crate) fn filter_may_select_points(&self, filter: &SpanFilter) -> bool {
+        self.layers.iter().any(|layer| {
+            filter
+                .layer_ids()
+                .is_none_or(|ids| ids.iter().any(|id| id == layer.id()))
+                && (layer.is_source() || layer.point_span_count > 0)
+        })
+    }
+
+    pub(crate) fn selection_for_filter_within(
+        &self,
+        filter: &SpanFilter,
+        hits: &Selection,
+    ) -> Result<Selection, Error> {
+        let indices = self.matching_layer_indices(filter)?;
+        // Source results must still be validated, even when hits are empty.
+        // Keeping the full source read also preserves its error behavior.
+        if hits.ranges() == [0..self.len()] {
+            return self.selection_for_filter(filter);
+        }
+        if indices.iter().any(|&index| self.layers[index].is_source()) {
+            return Ok(hits.intersect(&self.selection_for_filter(filter)?));
+        }
+        let covered: u64 = hits
+            .ranges()
+            .iter()
+            .map(|r| u64::from(r.end - r.start) + 1)
+            .sum();
         let mut ranges = Vec::new();
         for index in indices {
             let layer = &self.layers[index];
-            let slots: Vec<usize> = if let Some((key, value)) = filter.index_hint() {
+            let count = layer.span_slots.len();
+            if count == 0 || hits.is_empty() {
+                continue;
+            }
+            let candidates = filter.index_hint().map_or(count, |(key, value)| {
+                layer.estimated_matching_count(key, value)
+            });
+            // Estimate interval-tree probes plus the fraction of spans covered
+            // by the hits. No index is built merely to produce this estimate.
+            let position_cost = hits
+                .ranges()
+                .len()
+                .saturating_mul(count.ilog2() as usize + 1)
+                .saturating_add(
+                    (covered.saturating_mul(count as u64) / (u64::from(self.len()) + 1))
+                        .min(usize::MAX as u64) as usize,
+                );
+            // Include boundary-adjacent text ranges as well as touching ones.
+            // They may absorb points during normalization before intersection.
+            let slots = if position_cost < candidates {
+                let mut slots: Vec<_> = hits
+                    .ranges()
+                    .iter()
+                    .flat_map(|range| layer.position_slots(range, true))
+                    .collect();
+                slots.sort_unstable();
+                slots.dedup();
+                slots
+            } else if let Some((key, value)) = filter.index_hint() {
                 layer.matching_slots(key, value)
             } else {
                 layer.span_slots.values().copied().collect()
@@ -653,6 +733,12 @@ impl Document {
                 }
             }
         }
+        Ok(hits.intersect(&Selection::from_ranges(ranges)))
+    }
+
+    pub(crate) fn matching_ranges(&self, filter: &SpanFilter) -> Result<Vec<Range<u32>>, Error> {
+        let mut ranges = Vec::new();
+        self.visit_matching_ranges(filter, |matched| ranges.extend_from_slice(matched))?;
         Ok(ranges)
     }
 
@@ -661,33 +747,116 @@ impl Document {
         filter: &SpanFilter,
         hits: &Selection,
     ) -> Result<usize, Error> {
-        let indices = self.matching_layer_indices(filter)?;
-        if indices.iter().any(|&index| self.layers[index].is_source()) {
-            return Ok(self
-                .matching_spans(filter)?
-                .iter()
-                .filter(|matched| span_ranges_touch(&matched.ranges, hits))
-                .count());
-        }
-
         let mut count = 0;
-        for index in indices {
+        let full = hits.ranges() == [0..self.len()];
+        for index in self.matching_layer_indices(filter)? {
             let layer = &self.layers[index];
-            let slots: Vec<usize> = if let Some((key, value)) = filter.index_hint() {
-                layer.matching_slots(key, value)
+            if full && !filter.has_conditions() && !layer.is_source() {
+                // Vacant slots have no ranges, just like spans with empty targets.
+                count += layer
+                    .resolved_ranges
+                    .iter()
+                    .filter(|r| !r.is_empty())
+                    .count();
             } else {
-                layer.span_slots.values().copied().collect()
-            };
-            for slot in slots {
-                let span = layer.spans[slot].as_ref().unwrap();
-                if filter.matches(self, span, layer.id())
-                    && span_ranges_touch(&layer.resolved_ranges[slot], hits)
-                {
-                    count += 1;
-                }
+                self.visit_matching_layer_ranges(layer, filter, |ranges| {
+                    count += usize::from(if full {
+                        !ranges.is_empty()
+                    } else {
+                        span_ranges_touch(ranges, hits)
+                    });
+                })?;
             }
         }
         Ok(count)
+    }
+
+    // Visit one slice per span. Stored ranges already resolved and validated at
+    // insertion need not be cloned or re-resolved for range-only queries.
+    pub(crate) fn visit_matching_ranges(
+        &self,
+        filter: &SpanFilter,
+        mut visit: impl FnMut(&[Range<u32>]),
+    ) -> Result<(), Error> {
+        for index in self.matching_layer_indices(filter)? {
+            self.visit_matching_layer_ranges(&self.layers[index], filter, &mut visit)?;
+        }
+        Ok(())
+    }
+
+    fn visit_matching_layer_ranges(
+        &self,
+        layer: &Layer,
+        filter: &SpanFilter,
+        mut visit: impl FnMut(&[Range<u32>]),
+    ) -> Result<(), Error> {
+        if layer.is_source() {
+            for span in self.read_source_spans(layer, filter)? {
+                if let Some(ranges) = self.matching_source_ranges(layer, filter, &span)? {
+                    visit(&ranges);
+                }
+            }
+            return Ok(());
+        }
+        if !filter.has_conditions() {
+            // Empty targets and cleared slots never contribute a range.
+            for ranges in &layer.resolved_ranges {
+                if !ranges.is_empty() {
+                    visit(ranges);
+                }
+            }
+            return Ok(());
+        }
+        let visit_slot = |slot: usize| {
+            let span = layer.spans[slot].as_ref().unwrap();
+            if filter.matches(self, span, layer.id()) {
+                visit(&layer.resolved_ranges[slot]);
+            }
+        };
+        if let Some((key, value)) = filter.index_hint() {
+            layer
+                .matching_slots(key, value)
+                .into_iter()
+                .for_each(visit_slot);
+        } else {
+            layer.span_slots.values().copied().for_each(visit_slot);
+        }
+        Ok(())
+    }
+
+    fn read_source_spans(&self, layer: &Layer, filter: &SpanFilter) -> Result<Vec<Span>, Error> {
+        let source = layer.span_source().unwrap();
+        source
+            .find_spans(filter)
+            .unwrap_or_else(|| source.get_spans(0..self.len()))
+            .map_err(|error| Error::Source {
+                layer: layer.id().into(),
+                error,
+            })
+    }
+
+    fn matching_source_ranges<'a>(
+        &'a self,
+        layer: &Layer,
+        filter: &SpanFilter,
+        span: &'a Span,
+    ) -> Result<Option<Cow<'a, [Range<u32>]>>, Error> {
+        if !filter.matches(self, span, layer.id()) || span.id().is_none() {
+            return Ok(None);
+        }
+        let ranges = match span.target() {
+            Target::Span(reference) => self.ranges(reference).map(Cow::Borrowed),
+            Target::Text(ranges) if ranges.len() <= 1 => {
+                if let Some(range) = ranges.first() {
+                    self.validate_range(range)?;
+                }
+                Some(Cow::Borrowed(ranges.as_slice()))
+            }
+            Target::Text(ranges) => Some(Cow::Owned(
+                self.selection_from_ranges(ranges.clone())?.into_ranges(),
+            )),
+        };
+        Ok(ranges)
     }
 
     fn matching_layer_indices(&self, filter: &SpanFilter) -> Result<Vec<usize>, Error> {
@@ -710,45 +879,39 @@ impl Document {
         let mut matches = Vec::new();
         for layer_index in self.matching_layer_indices(filter)? {
             let layer = &self.layers[layer_index];
-            let spans = if let Some(source) = layer.span_source() {
-                let result = source
-                    .find_spans(filter)
-                    .unwrap_or_else(|| source.get_spans(0..self.len()));
-                result.map_err(|error| Error::Source {
-                    layer: layer.id().into(),
-                    error,
-                })?
-            } else if let Some((key, value)) = filter.index_hint() {
+            if layer.is_source() {
+                for span in self.read_source_spans(layer, filter)? {
+                    if let Some(ranges) = self.matching_source_ranges(layer, filter, &span)? {
+                        let ranges = ranges.into_owned();
+                        matches.push(MatchedSpan {
+                            layer_index,
+                            span,
+                            ranges,
+                        });
+                    }
+                }
+                continue;
+            }
+            let mut push_slot = |slot: usize| {
+                let span = layer.spans[slot].as_ref().unwrap();
+                if filter.matches(self, span, layer.id()) {
+                    matches.push(MatchedSpan {
+                        layer_index,
+                        span: span.clone(),
+                        ranges: layer.resolved_ranges[slot].clone(),
+                    });
+                }
+            };
+            if let Some((key, value)) = filter.index_hint() {
                 layer
                     .matching_slots(key, value)
                     .into_iter()
-                    .filter_map(|slot| layer.spans[slot].as_ref().cloned())
-                    .collect()
+                    .for_each(push_slot);
             } else {
-                layer.spans().cloned().collect()
-            };
-
-            for span in spans {
-                if !filter.matches(self, &span, layer.id()) {
-                    continue;
+                // Preserve ordering for materialized spans with tied starts.
+                for slot in layer.slots_in_position_order() {
+                    push_slot(slot);
                 }
-                if layer.is_source() && span.id().is_none() {
-                    continue;
-                }
-                let ranges = match span.target() {
-                    Target::Text(ranges) => ranges.clone(),
-                    Target::Span(reference) => match self.ranges(reference) {
-                        Some(ranges) => ranges.to_vec(),
-                        None => continue,
-                    },
-                };
-                // Source-provided ranges still obey the same bounds and UTF-8 rules as stored spans.
-                let ranges = self.selection_from_ranges(ranges)?.ranges().to_vec();
-                matches.push(MatchedSpan {
-                    layer_index,
-                    span,
-                    ranges,
-                });
             }
         }
         Ok(matches)
@@ -898,7 +1061,7 @@ impl Document {
     }
 }
 
-fn span_ranges_touch(ranges: &[Range<u32>], selection: &Selection) -> bool {
+pub(crate) fn span_ranges_touch(ranges: &[Range<u32>], selection: &Selection) -> bool {
     ranges.iter().any(|span| {
         selection.ranges().iter().any(|hit| {
             if span.start == span.end {
@@ -1111,7 +1274,11 @@ impl Span {
 /// Creates a span targeting one document byte range.
 impl From<Range<u32>> for Span {
     fn from(range: Range<u32>) -> Self {
-        Self::from(vec![range])
+        Self {
+            id: None,
+            target: Target::Text(vec![range]),
+            attrs: Attributes::default(),
+        }
     }
 }
 

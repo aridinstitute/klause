@@ -401,9 +401,19 @@ text.
 - `Distance::at_most(n, layer)`: at most `n` spans of `layer` lie wholly in between;
 - `Distance::bytes(n)`: at most `n` bytes in between.
 
-**Order.** Steps other than `expand_to` are intersections, so between two `expand_to` steps their order doesn't
-change the result, and the query runs the cheapest first. `expand_to` replaces the hits, so steps before it see the
-old hits and steps after it see the new ones.
+**Order.** Between two `expand_to` steps, selection restrictions (`within`, `outside`, `in_layer`, and `in_span`)
+run first, text searches second, and proximity filters last, regardless of where those steps appear in the chain.
+Thus `with_text("the earth").in_layer("words")` searches inside each word, not across word boundaries. The planner
+uses layer sizes and available attribute-index cardinalities to order selection work, and uses narrowed hits to
+choose between position and attribute lookups. Planning never reads a source or builds an index just to estimate
+its cost. Selectors are resolved only at the final verb, including application-defined `IntoSelection` inputs.
+
+Text searches retain their relative order because each searches within the matches of the preceding search.
+Selection steps that may contain points also retain their place among selection steps: inclusive point
+boundaries make their order significant. Unknown custom selectors and source selectors are treated
+conservatively in the same way. Proximity filters are ordered by estimated candidate counts after text search.
+`expand_to` replaces the hits and is a hard planning boundary: steps before it see the old hits and steps after it
+see the new ones. A step's errors still surface even if an earlier planned step produces no hits.
 
 **Passage layers.** `.with_layers(["words", "structure"])` limits which layers' spans the passages from
 `get_passages` and `get_passage` contain. It doesn't affect the other steps.

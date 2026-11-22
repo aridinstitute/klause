@@ -17,6 +17,7 @@ pub struct Layer {
     pub(crate) span_slots: BTreeMap<SpanId, usize>,
     pub(crate) next_id: Option<u64>,
     pub(crate) resolved_ranges: Vec<Vec<Range<u32>>>,
+    pub(crate) point_span_count: usize,
     // Slot addresses (layer index, slot), allocated only through the last targeted slot.
     pub(crate) dependents: Vec<Vec<(usize, usize)>>,
     pub(crate) free_slots: Vec<usize>,
@@ -74,7 +75,12 @@ impl PositionIndex {
         entry.max_end
     }
 
-    fn touching(entries: &[PositionEntry], range: &Range<u32>, slots: &mut Vec<usize>) {
+    fn lookup(
+        entries: &[PositionEntry],
+        range: &Range<u32>,
+        include_boundaries: bool,
+        slots: &mut Vec<usize>,
+    ) {
         if entries.is_empty() {
             return;
         }
@@ -83,11 +89,13 @@ impl PositionIndex {
         if entry.max_end < range.start {
             return;
         }
-        Self::touching(&entries[..mid], range, slots);
+        Self::lookup(&entries[..mid], range, include_boundaries, slots);
         if entry.start > range.end {
             return;
         }
-        let touches = if entry.start == entry.end {
+        let touches = if include_boundaries {
+            entry.end >= range.start
+        } else if entry.start == entry.end {
             range.start <= entry.start && entry.start <= range.end
         } else {
             range.start < range.end && entry.start < range.end && range.start < entry.end
@@ -95,7 +103,7 @@ impl PositionIndex {
         if touches {
             slots.push(entry.slot);
         }
-        Self::touching(&entries[mid + 1..], range, slots);
+        Self::lookup(&entries[mid + 1..], range, include_boundaries, slots);
     }
 }
 
@@ -155,6 +163,7 @@ impl Layer {
             span_slots: BTreeMap::new(),
             next_id: Some(1),
             resolved_ranges: Vec::new(),
+            point_span_count: 0,
             dependents: Vec::new(),
             free_slots: Vec::new(),
             attribute_index: RefCell::new(None),
@@ -291,6 +300,12 @@ impl Layer {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn spans(&self) -> impl Iterator<Item = &Span> {
+        self.slots_in_position_order()
+            .into_iter()
+            .map(|slot| self.spans[slot].as_ref().unwrap())
+    }
+
+    pub(crate) fn slots_in_position_order(&self) -> Vec<usize> {
         let mut slots: Vec<usize> = self.span_slots.values().copied().collect();
         slots.sort_by_key(|&slot| {
             self.resolved_ranges[slot]
@@ -298,8 +313,6 @@ impl Layer {
                 .map_or(u32::MAX, |range| range.start)
         });
         slots
-            .into_iter()
-            .map(|slot| self.spans[slot].as_ref().unwrap())
     }
 
     pub(crate) fn span_source(&self) -> Option<&dyn SpanSource> {
@@ -315,12 +328,7 @@ impl Layer {
     }
 
     pub(crate) fn touching_slots(&self, range: &Range<u32>) -> Vec<usize> {
-        let mut index = self.position_index.borrow_mut();
-        let index = index.get_or_insert_with(|| PositionIndex::build(self));
-        let mut slots = Vec::new();
-        PositionIndex::touching(&index.entries, range, &mut slots);
-        slots.sort_unstable();
-        slots.dedup();
+        let mut slots = self.position_slots(range, false);
         // Match spans() ordering, including ID order for equal starts.
         slots.sort_unstable_by(|&a, &b| {
             self.resolved_ranges[a][0]
@@ -335,6 +343,35 @@ impl Layer {
                 })
         });
         slots
+    }
+
+    pub(crate) fn position_slots(
+        &self,
+        range: &Range<u32>,
+        include_boundaries: bool,
+    ) -> Vec<usize> {
+        let mut index = self.position_index.borrow_mut();
+        let index = index.get_or_insert_with(|| PositionIndex::build(self));
+        let mut slots = Vec::new();
+        PositionIndex::lookup(&index.entries, range, include_boundaries, &mut slots);
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
+    pub(crate) fn estimated_matching_count(&self, key: &str, value: &Value) -> usize {
+        let index = self.attribute_index.borrow();
+        let Some(index) = index.as_ref() else {
+            return self.span_slots.len();
+        };
+        let Some(values) = index.get(key) else {
+            return 0;
+        };
+        indexed_values_for(value)
+            .iter()
+            .filter_map(|value| values.get(value))
+            .map(Vec::len)
+            .sum()
     }
 
     pub(crate) fn matching_slots(&self, key: &str, value: &Value) -> Vec<usize> {
@@ -419,6 +456,61 @@ impl From<&str> for Layer {
 mod tests {
     use super::*;
     use crate::Document;
+
+    #[test]
+    fn planning_estimates_reuse_indexes_without_building_them() {
+        let mut doc = Document::new("test").with_layer("words");
+        doc.push("word word").unwrap();
+        doc.add_span("words", Span::from(0..4).with_attr("pos", "verb"))
+            .unwrap();
+        doc.add_span("words", Span::from(5..9).with_attr("pos", "noun"))
+            .unwrap();
+        let layer = doc.layer("words").unwrap();
+        let verb = Value::from("verb");
+        assert_eq!(layer.estimated_matching_count("pos", &verb), 2);
+        assert!(layer.attribute_index.borrow().is_none());
+        assert!(layer.position_index.borrow().is_none());
+        assert_eq!(layer.matching_slots("pos", &verb).len(), 1);
+        assert_eq!(layer.estimated_matching_count("pos", &verb), 1);
+        assert_eq!(
+            layer.estimated_matching_count("pos", &Value::from("absent")),
+            0
+        );
+        assert!(layer.position_index.borrow().is_none());
+    }
+
+    #[test]
+    fn point_statistics_follow_edits_and_target_cascades() {
+        fn check(doc: &Document) {
+            for layer in doc.layers() {
+                assert_eq!(
+                    layer.point_span_count,
+                    layer
+                        .span_slots
+                        .values()
+                        .filter(|&&slot| layer.resolved_ranges[slot].iter().any(Range::is_empty))
+                        .count()
+                );
+            }
+        }
+        let mut doc = Document::new("test").with_layer("words").with_layer("tags");
+        doc.push("word").unwrap();
+        let word = doc.add_span("words", Span::from(0..4)).unwrap();
+        doc.add_span("tags", Span::on_ref(&word)).unwrap();
+        check(&doc);
+        doc.replace_span(&word, Span::from(2..2)).unwrap();
+        check(&doc);
+        assert_eq!(doc.layer("tags").unwrap().point_span_count, 1);
+        doc.replace_span(&word, Span::from(0..4)).unwrap();
+        check(&doc);
+        doc.replace_span(&word, Span::from(4..4)).unwrap();
+        check(&doc);
+        doc.remove_span(&word).unwrap();
+        check(&doc);
+        assert_eq!(doc.layer("tags").unwrap().point_span_count, 0);
+        doc.add_span("words", Span::from(0..4)).unwrap();
+        check(&doc);
+    }
 
     #[test]
     fn position_index_is_lazy_and_only_invalidated_by_span_edits() {

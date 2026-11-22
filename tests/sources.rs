@@ -117,3 +117,41 @@ fn a_failing_source_still_loads_passages_but_fails_queries_that_need_it() {
     ));
     assert_eq!(doc.find().in_layer("words").count().unwrap(), 17);
 }
+
+#[test]
+fn query_sources_are_read_at_the_final_verb_not_during_building_or_planning() {
+    let (doc, highlights) = with_highlights();
+    let query = doc.find().with_text("God").in_layer("highlights");
+    highlights.save(Span::from(at("God", 0)).with_id(1_u64));
+    assert_eq!(query.get_selection().unwrap().ranges(), [at("God", 0)]);
+
+    let query = doc.find().in_layer("highlights");
+    highlights.down.store(true, Ordering::SeqCst);
+    assert!(matches!(query.count(), Err(Error::Source { .. })));
+    assert!(matches!(
+        doc.find()
+            .within(Vec::<std::ops::Range<u32>>::new())
+            .in_layer("highlights")
+            .count(),
+        Err(Error::Source { .. })
+    ));
+}
+
+#[test]
+fn source_range_only_queries_still_normalize_and_validate() {
+    let (doc, highlights) = with_highlights();
+    highlights.save(Span::from(vec![1..1, 1..3]).with_id(1_u64));
+    highlights.save(Span::from(3..3).with_id(2_u64));
+    highlights.save(Span::from(4..5)); // Anonymous source spans are skipped.
+    let filter = || spans_in("highlights");
+    assert_eq!(doc.find().count_spans(filter()).unwrap(), 2);
+    assert_eq!(doc.find().within(1..1).count_spans(filter()).unwrap(), 0);
+    assert_eq!(doc.find().within(3..3).count_spans(filter()).unwrap(), 1);
+
+    let invalid = 0..doc.len() + 1;
+    highlights.save(Span::from(invalid.clone()).with_id(3_u64));
+    assert!(matches!(
+        doc.find().within(Vec::<std::ops::Range<u32>>::new()).count_spans(filter()),
+        Err(Error::OutOfRange(range)) if range == invalid
+    ));
+}

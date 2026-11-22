@@ -30,6 +30,13 @@ impl Selection {
         &self.ranges
     }
 
+    pub(crate) fn into_ranges(self) -> Vec<Range<u32>> {
+        self.ranges
+    }
+
+    pub(crate) fn retain_ranges(&mut self, keep: impl FnMut(&Range<u32>) -> bool) {
+        self.ranges.retain(keep);
+    }
     /// Returns a selection containing ranges from either selection.
     ///
     /// # Example
@@ -114,43 +121,49 @@ impl Selection {
     /// assert_eq!(phrase.subtract(&word).ranges(), &[11..15]);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn subtract(&self, _other: &Selection) -> Selection {
+    pub fn subtract(&self, other: &Selection) -> Selection {
         let mut ranges = Vec::new();
-        for range in self.ranges.iter().filter(|range| range.start < range.end) {
-            let mut pieces = vec![range.clone()];
-            for subtract in _other.ranges.iter().filter(|range| range.start < range.end) {
-                let mut next = Vec::new();
-                for piece in pieces {
-                    if subtract.end <= piece.start || subtract.start >= piece.end {
-                        next.push(piece);
-                    } else {
-                        if piece.start < subtract.start {
-                            next.push(piece.start..subtract.start);
-                        }
-                        if subtract.end < piece.end {
-                            next.push(subtract.end..piece.end);
-                        }
-                    }
+        let mut cuts = other.ranges.iter().peekable();
+        for left in &self.ranges {
+            while cuts.peek().is_some_and(|cut| cut.end < left.start) {
+                cuts.next();
+            }
+
+            if left.start == left.end {
+                // A point is removed even at the end of a cut. A point cut,
+                // on the other hand, never removes bytes from a nonempty range.
+                if !cuts
+                    .peek()
+                    .is_some_and(|cut| contains_point(cut, left.start))
+                {
+                    ranges.push(left.clone());
                 }
-                pieces = next;
-                if pieces.is_empty() {
+                continue;
+            }
+
+            let mut start = left.start;
+            while let Some(cut) = cuts.peek().filter(|cut| cut.start < left.end) {
+                if cut.start == cut.end || cut.end <= start {
+                    cuts.next();
+                    continue;
+                }
+                if start < cut.start {
+                    ranges.push(start..cut.start);
+                }
+                start = cut.end;
+                if start >= left.end {
+                    // The same cut might also cover a later range or point.
                     break;
                 }
+                cuts.next();
             }
-            ranges.extend(pieces);
-        }
-
-        for point in self.ranges.iter().filter(|range| range.start == range.end) {
-            if !_other
-                .ranges
-                .iter()
-                .any(|range| contains_point(range, point.start))
-            {
-                ranges.push(point.clone());
+            if start < left.end {
+                ranges.push(start..left.end);
             }
         }
-
-        Self::from_ranges(ranges)
+        // Subtraction only shrinks or splits normalized ranges, so the output
+        // is already sorted and disjoint, with any surviving points isolated.
+        Self { ranges }
     }
 
     /// Returns whether the byte position is selected, either by a range or as a point.
@@ -193,6 +206,12 @@ impl Selection {
     }
 
     pub(crate) fn from_ranges(ranges: Vec<Range<u32>>) -> Self {
+        // The common case is already normalized (e.g. one range per word).
+        if ranges.iter().all(|range| range.start <= range.end)
+            && ranges.windows(2).all(|pair| pair[0].end < pair[1].start)
+        {
+            return Self { ranges };
+        }
         let mut non_empty = Vec::new();
         let mut points = Vec::new();
         for range in ranges {
@@ -241,6 +260,31 @@ fn contains_point(range: &Range<u32>, point: u32) -> bool {
 
 /// Text described against a document, resolved when a query step or passage runs.
 pub trait IntoSelection {
+    /// Whether this selector might contain point ranges. Unknown selectors are
+    /// conservative so planning preserves their order among selection steps.
+    #[doc(hidden)]
+    fn may_select_points(&self, _doc: &Document) -> bool {
+        true
+    }
+
+    /// Estimates candidate work for query planning without resolving the selector.
+    ///
+    /// Custom selectors may keep the default conservative estimate. This hint
+    /// affects execution order, never whether a selector is evaluated.
+    #[doc(hidden)]
+    fn estimate_cost(&self, doc: &Document) -> usize {
+        doc.len() as usize
+    }
+
+    /// Resolves this selector and intersects it with already narrowed query hits.
+    #[doc(hidden)]
+    fn into_selection_within(self, doc: &Document, hits: &Selection) -> Result<Selection, Error>
+    where
+        Self: Sized,
+    {
+        Ok(hits.intersect(&self.into_selection(doc)?))
+    }
+
     /// Resolves this description into text ranges for the given document.
     ///
     /// # Example
@@ -259,36 +303,85 @@ pub trait IntoSelection {
 }
 
 impl IntoSelection for Range<u32> {
+    fn may_select_points(&self, _doc: &Document) -> bool {
+        self.is_empty()
+    }
+
+    fn estimate_cost(&self, _doc: &Document) -> usize {
+        1
+    }
+
     fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
         doc.selection_from_ranges(vec![self])
     }
 }
 
 impl IntoSelection for RangeFull {
+    fn may_select_points(&self, doc: &Document) -> bool {
+        doc.is_empty()
+    }
+
+    fn estimate_cost(&self, _doc: &Document) -> usize {
+        1
+    }
+
     fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
         doc.selection_from_ranges(core::iter::once(0..doc.len()).collect())
     }
 }
 
 impl IntoSelection for Vec<Range<u32>> {
+    fn may_select_points(&self, _doc: &Document) -> bool {
+        self.iter().any(Range::is_empty)
+    }
+
+    fn estimate_cost(&self, _doc: &Document) -> usize {
+        self.len()
+    }
+
     fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
         doc.selection_from_ranges(self)
     }
 }
 
 impl IntoSelection for Selection {
+    fn may_select_points(&self, _doc: &Document) -> bool {
+        self.ranges.iter().any(Range::is_empty)
+    }
+
+    fn estimate_cost(&self, _doc: &Document) -> usize {
+        self.ranges.len()
+    }
+
     fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
         doc.selection_from_ranges(self.ranges)
     }
 }
 
 impl IntoSelection for &Selection {
+    fn may_select_points(&self, _doc: &Document) -> bool {
+        self.ranges.iter().any(Range::is_empty)
+    }
+
+    fn estimate_cost(&self, _doc: &Document) -> usize {
+        self.ranges.len()
+    }
+
     fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
         doc.selection_from_ranges(self.ranges.clone())
     }
 }
 
 impl IntoSelection for SpanRef {
+    fn may_select_points(&self, doc: &Document) -> bool {
+        doc.ranges(self)
+            .is_none_or(|ranges| ranges.iter().any(Range::is_empty))
+    }
+
+    fn estimate_cost(&self, doc: &Document) -> usize {
+        doc.ranges(self).map_or(1, <[_]>::len)
+    }
+
     fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
         let ranges = doc
             .ranges(&self)
@@ -298,12 +391,32 @@ impl IntoSelection for SpanRef {
 }
 
 impl IntoSelection for SpanFilter {
+    fn may_select_points(&self, doc: &Document) -> bool {
+        doc.filter_may_select_points(self)
+    }
+
+    fn estimate_cost(&self, doc: &Document) -> usize {
+        doc.estimate_filter_cost(self)
+    }
+
+    fn into_selection_within(self, doc: &Document, hits: &Selection) -> Result<Selection, Error> {
+        doc.selection_for_filter_within(&self, hits)
+    }
+
     fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
         doc.selection_for_filter(&self)
     }
 }
 
 impl<const N: usize> IntoSelection for [Range<u32>; N] {
+    fn may_select_points(&self, _doc: &Document) -> bool {
+        self.iter().any(Range::is_empty)
+    }
+
+    fn estimate_cost(&self, _doc: &Document) -> usize {
+        N
+    }
+
     fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
         doc.selection_from_ranges(Vec::from(self))
     }
@@ -349,6 +462,10 @@ impl SpanFilter {
 
     pub(crate) fn layer_ids(&self) -> Option<&[String]> {
         self.layers.as_deref()
+    }
+
+    pub(crate) fn has_conditions(&self) -> bool {
+        !self.conditions.is_empty()
     }
 
     pub(crate) fn index_hint(&self) -> Option<(&str, &Value)> {

@@ -205,3 +205,21 @@ fn set_operations_keep_points_that_lie_within_the_other_side() {
     assert_eq!(points.intersect(&a).ranges(), [10..10, 30..30]);
     assert!(b.intersect(&get(vec![30..35])).is_empty());
 }
+
+#[test]
+fn subtraction_keeps_a_cut_across_ranges_and_preserves_point_rules() {
+    let doc = genesis();
+    let left = doc
+        .get_selection(vec![0..5, 7..10, 11..11, 13..20, 23..23, 25..25, 30..35])
+        .unwrap();
+    let cuts = doc
+        .get_selection(vec![3..11, 13..13, 14..16, 17..19, 23..23, 35..38])
+        .unwrap();
+
+    // The first cut hits two ranges and removes the point at its end.
+    // The cut at 13 removes no bytes; the matching point at 23 is removed.
+    assert_eq!(
+        left.subtract(&cuts).ranges(),
+        [0..3, 13..14, 16..17, 19..20, 25..25, 30..35]
+    );
+}

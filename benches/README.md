@@ -17,6 +17,29 @@ tagged as verbs, nouns, or other. It measures attribute-filtered span counts
 and the selection produced by filtering for verbs. Fixture construction is
 excluded from the timed operations.
 
+For a per-filter comparison at 100,000 words, or a separate proximity run:
+
+```sh
+cargo bench --bench filtering -- '^filter_types/.*/100000$'
+cargo bench --bench filtering -- '^proximity/'
+# All filtering cases on the 790,000-word fixture:
+cargo bench --bench filtering -- '/790000$'
+```
+
+| Group | What it measures |
+| :-- | :-- |
+| `filter_types` | Warm span counts for layer-only and all-layer filters, exact values (string, integer, float, bool), bounded and open numeric ranges, `any_of`, a custom matcher, attribute negation, key presence and absence, span ID, target span, and combined predicates. `source_fallback` uses an in-memory generated source with no pushdown or external I/O; `all_layers` includes that layer. |
+| `query_filters` | Warm range counts for `in_layer`, `outside`, and `expand_to`. See `planning` below for chapter-scoped `in_span`, `within`, and literal/folded text search. |
+| `proximity` | Both directions (`followed_by` / `preceded_by`) with adjacent, byte, and intervening-span distances at 128, 512, and 790,000 words. |
+
+Each new case checks its expected count before timing. `filter_types` excludes
+fixture creation, filter construction/cloning, and first-use index creation;
+`query_filters` and `proximity` include query construction. Most predicate cases
+match about one word in 16, but layer-only and all-layer cases match whole
+layers, span ID matches one span, and the integer and combined cases match
+about one word in 32. Use these as representative workloads, not as costs per
+match or as end-to-end timings.
+
 The fixture has 1,000, 100,000, or 790,000 words, each with one morphology span
 targeting it and carrying `pos` and `strongs`. The largest has 4.74 MB of text
 and 1.58 million spans. Edits use a word → morphology → review chain with all
@@ -72,10 +95,63 @@ Criterion's noise threshold); the word/morphology build changed from 374 ms to
 386 ms, and chain removal from 3.90 µs to 5.88 µs. This is not an across-the-board
 speedup.
 
-These fixtures do **not** implement the complete Bible workload in `DESIGN.md`.
-They measure one attribute-filter path but not source layers, passage loading,
-value counting, folded text search, or resident memory, so they do not establish
-those targets or the end-to-end first-query target.
+These original measurements cover one attribute filter, not the full Bible
+workload in `DESIGN.md`. The expanded filtering cases use synthetic data and
+an in-memory source; they do not measure real source I/O, value counting,
+resident memory, or the end-to-end first-query target.
+
+## Filtering after the 100 ms optimization pass
+
+Release-mode Criterion run: all 87 filtering cases completed. The table shows
+all 29 filtering cases measured at 790,000 words, plus the four chapter-scoped
+planning cases on a 790,000-word document. The upper bound is from Criterion's
+estimate interval, not a per-query tail latency. The largest estimate was
+69.23 ms (source fallback), with an upper bound of 69.68 ms.
+
+| Benchmark | Point estimate | Upper bound |
+| :-- | --: | --: |
+| `filtering/first_attribute_filter_count_spans` | 52.19 ms | 54.02 ms |
+| `filtering/attribute_filter_count_spans` | 3.92 ms | 4.06 ms |
+| `filtering/attribute_filter_selection` | 3.22 ms | 3.29 ms |
+| `filter_types/layer_only` | 155.08 µs | 155.63 µs |
+| `filter_types/all_layers` | 66.34 ms | 67.48 ms |
+| `filter_types/exact_string` | 4.94 ms | 5.16 ms |
+| `filter_types/exact_integer` | 1.55 ms | 1.68 ms |
+| `filter_types/exact_float` | 3.97 ms | 4.25 ms |
+| `filter_types/exact_bool` | 2.46 ms | 2.52 ms |
+| `filter_types/bounded_range` | 15.94 ms | 16.01 ms |
+| `filter_types/open_range` | 15.65 ms | 15.89 ms |
+| `filter_types/any_of` | 17.31 ms | 17.84 ms |
+| `filter_types/custom_matcher` | 15.19 ms | 15.27 ms |
+| `filter_types/without_attr` | 17.56 ms | 18 ms |
+| `filter_types/with_key` | 14.87 ms | 15.17 ms |
+| `filter_types/without_key` | 16.38 ms | 16.48 ms |
+| `filter_types/with_id` | 10.95 ms | 11 ms |
+| `filter_types/targeting` | 45.47 ms | 45.59 ms |
+| `filter_types/combined` | 6.69 ms | 6.71 ms |
+| `filter_types/source_fallback` | 69.23 ms | 69.68 ms |
+| `query_filters/in_layer` | 2.45 ms | 2.54 ms |
+| `query_filters/outside` | 5.65 ms | 5.99 ms |
+| `query_filters/expand_to` | 5.76 ms | 5.88 ms |
+| `proximity/followed_by_adjacent` | 25.27 ms | 25.31 ms |
+| `proximity/preceded_by_adjacent` | 25.81 ms | 26.14 ms |
+| `proximity/followed_by_bytes` | 24.62 ms | 25.31 ms |
+| `proximity/preceded_by_bytes` | 24.54 ms | 24.67 ms |
+| `proximity/followed_by_span_count` | 30.08 ms | 30.15 ms |
+| `proximity/preceded_by_span_count` | 30.07 ms | 30.19 ms |
+| `planning/literal` | 2.194 µs | 2.199 µs |
+| `planning/folded` | 60.488 µs | 61.043 µs |
+| `planning/filter_cold` | 13.97 ms | 14.2 ms |
+| `planning/filter_warm` | 8.076 µs | 8.11 µs |
+
+The previous full run measured `outside` at 1.30 s, `all_layers` at 471.21 ms,
+and `expand_to` at 36.59 ms on this size. Span-count proximity at 512 words
+went from 2.12–2.36 ms to 9.27–9.32 µs; no pre-optimization proximity timings
+were taken at 790,000 words.
+
+These are span counts and selection/range queries on synthetic corpora, not
+end-to-end timings or measurements of real source I/O or materializing large
+result sets.
 
 ## Position-index results, 2026-11-21
 
@@ -100,7 +176,8 @@ Darwin, 14 logical CPUs, 48 GB RAM, single-threaded release, Criterion point est
 | Warm passage, before position index | 315 µs | 32.7 ms | 264 ms |
 | Warm passage, with position index | 108 µs | 108 µs | 108 µs |
 
-The position index is built only when a stored layer is included in a passage.
+The position index is built when a stored layer is included in a passage or a
+query chooses a position lookup within narrowed hits.
 It stores each resolved range separately, prunes subtrees by maximum end, and
 deduplicates matching slots. Adds, removals, and replacements invalidate affected
 layers, including downstream target layers. Text pushes alone keep it valid.
@@ -108,3 +185,54 @@ layers, including downstream target layers. Text pushes alone keep it valid.
 These passage measurements cover 1.58 million word/morphology spans at the
 largest size, not all layers in the complete Bible workload. They do not establish
 the full-workload chapter, memory, or build-through-first-query targets.
+
+## Query-planning results, 2026-11-21
+
+```sh
+cargo bench --bench planning
+# Measure the largest input in its own fresh process:
+KLAUSE_BENCH_WORDS=790000 cargo bench --bench planning
+```
+
+This fixture has 1,000, 100,000, or 790,000 words, each with a `pos` attribute,
+plus one chapter per 500 words. Text is `"word. "` repeated. The measured text
+queries put literal/folded search **before** `in_span("chapters", 0)` in the
+builder chain and must return exactly 500 matches. The filter query puts
+`within(spans_in("words").with_attr("pos", "verb"))` before that chapter
+restriction and must return 32 matches (every sixteenth word is a verb).
+
+The planner applies the chapter restriction first. The filter can then use the
+position index for local candidates instead of indexing attributes across the
+whole document. Query construction and execution are both timed. Cold filter
+measurements use a newly built document per iteration, excluding document setup
+and destruction but including any lazy index construction. Text and warm filter
+timings reuse one document and include result destruction.
+
+Same machine and Criterion settings as above. Before/after point estimates:
+
+| Operation | Before, 1,000 words | After, 1,000 words | Before, 790,000 words | After, 790,000 words |
+| :-- | --: | --: | --: | --: |
+| Literal search in chapter | 8.69 µs | 3.38 µs | 6.62 ms | 3.42 µs |
+| Folded search in chapter | 118 µs | 58.9 µs | 99.7 ms | 58.3 µs |
+| Cold verb filter in chapter | 48.5 µs | 13.2 µs | 50.8 ms | 12.3 ms |
+| Warm verb filter in chapter | 2.26 µs | 8.40 µs | 4.42 ms | 8.37 µs |
+
+In the fresh 790,000-word process, the first literal search took **34.3 µs** and
+the first folded search **75.7 µs**. Fixture construction is excluded. These
+first calls are reported separately from Criterion's warmed samples.
+
+The smallest warm filter regresses by about 6 µs: without a built attribute
+index, the cost model chooses a local position lookup and tests roughly 500
+spans, whereas the old warm path already had an attribute index with only 63
+verb candidates across the entire 1,000-word document. These estimates are not
+a promise that every query gets the optimal plan.
+
+Planning does not build indexes or read sources just to estimate costs.
+Unknown custom and source selectors retain their position among selection
+steps, as do selectors that might contain points. Text-search order is
+preserved; selection restrictions still run before text searches regardless of
+builder order. `expand_to` is a hard boundary. See `DESIGN.md` for the semantics.
+
+This benchmark is not the complete Bible fixture and does not establish the
+whole-document folded-search target, full-workload resident memory, proximity
+performance, or the build-through-first-query target.

@@ -162,6 +162,85 @@ fn followed_by_and_preceded_by_keep_hits_with_a_neighbour_within_the_distance() 
 }
 
 #[test]
+fn span_count_proximity_agrees_with_a_scan_for_points_and_multirange_spans() {
+    let mut doc = Document::new("proximity")
+        .with_layer("neighbours")
+        .with_layer("between");
+    doc.push("012345678901234567890123456789").unwrap();
+    let candidates = [25..28, 8..9, 17..17, 2..4, 8..10];
+    for candidate in &candidates {
+        doc.add_span("neighbours", Span::from(candidate.clone()))
+            .unwrap();
+    }
+    let intervening = [
+        vec![5..6, 7..8, 13..14],
+        vec![6..20],
+        vec![9..9],
+        vec![17..17],
+    ];
+    for ranges in &intervening {
+        doc.add_span("between", Span::from(ranges.clone())).unwrap();
+    }
+    let input = [0..1, 4..5, 9..9, 11..12, 16..17, 19..20, 29..30];
+    for follows in [true, false] {
+        for limit in 0..4 {
+            let expected: Vec<_> = input
+                .iter()
+                .filter(|hit| {
+                    candidates.iter().any(|candidate| {
+                        let gap = if follows && hit.end <= candidate.start {
+                            hit.end..candidate.start
+                        } else if !follows && candidate.end <= hit.start {
+                            candidate.end..hit.start
+                        } else {
+                            return false;
+                        };
+                        intervening
+                            .iter()
+                            .filter(|ranges| {
+                                ranges
+                                    .iter()
+                                    .any(|r| gap.start <= r.start && r.end <= gap.end)
+                            })
+                            .count()
+                            <= limit
+                    })
+                })
+                .cloned()
+                .collect();
+            let query = doc.find().within(input.clone());
+            let distance = Distance::at_most(limit, "between");
+            let query = if follows {
+                query.followed_by("neighbours", distance)
+            } else {
+                query.preceded_by("neighbours", distance)
+            };
+            assert_eq!(hits(query), expected, "follows={follows}, limit={limit}");
+        }
+    }
+}
+
+#[test]
+fn whole_document_counts_skip_empty_targets_and_vacant_slots() {
+    let mut doc = Document::new("counts")
+        .with_layer("words")
+        .with_layer("morph");
+    doc.push("word").unwrap();
+    let word = doc.add_span("words", Span::from(0..4)).unwrap();
+    doc.add_span("morph", Span::on("words", word.id().clone()))
+        .unwrap();
+    assert_eq!(doc.find().count_spans(all_spans()).unwrap(), 2);
+
+    doc.replace_span(&word, Span::from(Vec::<Range<u32>>::new()))
+        .unwrap();
+    assert_eq!(doc.find().count_spans(all_spans()).unwrap(), 0);
+    doc.replace_span(&word, Span::from(4..4)).unwrap();
+    assert_eq!(doc.find().count_spans(all_spans()).unwrap(), 2);
+    doc.remove_span(&word).unwrap();
+    assert_eq!(doc.find().count_spans(all_spans()).unwrap(), 0);
+}
+
+#[test]
 fn expand_to_replaces_the_hits_and_only_later_steps_see_the_new_ones() {
     let doc = genesis();
 
@@ -329,4 +408,254 @@ fn queries_fail_when_a_step_or_verb_names_an_unknown_layer() {
         doc.get_selection(spans_in("missing")),
         Err(Error::UnknownLayer(_))
     ));
+}
+
+#[test]
+fn selections_limit_literal_and_folded_searches_regardless_of_chain_order() {
+    let doc = genesis();
+    for folded in [false, true] {
+        let phrase = if folded {
+            doc.find().with_text_folded("THE EARTH")
+        } else {
+            doc.find().with_text("the earth")
+        };
+        assert!(hits(phrase.in_layer("words")).is_empty());
+        let word = if folded {
+            doc.find().with_text_folded("THE")
+        } else {
+            doc.find().with_text("the")
+        };
+        assert_eq!(hits(word.in_span("verses", "GEN 1:2")), [at("the", 3)]);
+    }
+    assert!(
+        hits(
+            doc.find()
+                .with_text("the earth")
+                .outside(at("earth", 0))
+                .in_span("verses", "GEN 1:1")
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn query_planning_keeps_expansions_as_boundaries_and_text_steps_in_order() {
+    let doc = genesis();
+    assert_eq!(
+        hits(
+            doc.find()
+                .with_text("God")
+                .in_span("verses", "GEN 1:1")
+                .expand_to("verses")
+                .with_text("the")
+        ),
+        [at("the", 0), at("the", 1), at("the", 2)]
+    );
+    assert!(
+        hits(
+            doc.find()
+                .with_text("God")
+                .in_span("verses", "GEN 1:1")
+                .expand_to("verses")
+                .with_text("the")
+                .in_span("verses", "GEN 1:2")
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        hits(doc.find().with_text("the earth").with_text("earth")),
+        [at("earth", 0), at("earth", 1)]
+    );
+    assert!(hits(doc.find().with_text("earth").with_text("the earth")).is_empty());
+}
+
+#[test]
+fn proximity_filters_run_after_selections_and_text_searches() {
+    let doc = genesis();
+    assert_eq!(
+        hits(
+            doc.find()
+                .followed_by(verbs(), Distance::adjacent())
+                .with_text("God")
+                .in_layer("words")
+        ),
+        [at("God", 0)]
+    );
+    assert_eq!(
+        hits(
+            doc.find()
+                .preceded_by(nouns(), Distance::bytes(1))
+                .with_text("created")
+                .in_layer("words")
+        ),
+        [at("created", 0)]
+    );
+}
+
+#[test]
+fn custom_selectors_are_deferred_and_receive_narrowed_hits_in_cost_order() {
+    use klause::{IntoSelection, Selection};
+    use std::{cell::RefCell, rc::Rc};
+
+    type Calls = RefCell<Vec<(usize, Vec<Range<u32>>)>>;
+    struct Tracked<'a> {
+        id: usize,
+        cost: usize,
+        calls: &'a Calls,
+        resolved: Rc<RefCell<usize>>,
+    }
+    impl IntoSelection for Tracked<'_> {
+        fn estimate_cost(&self, _doc: &Document) -> usize {
+            self.cost
+        }
+        fn may_select_points(&self, _doc: &Document) -> bool {
+            false
+        }
+        fn into_selection(self, doc: &Document) -> Result<Selection, Error> {
+            *self.resolved.borrow_mut() += 1;
+            (1..3).into_selection(doc)
+        }
+        fn into_selection_within(
+            self,
+            doc: &Document,
+            hits: &Selection,
+        ) -> Result<Selection, Error> {
+            self.calls
+                .borrow_mut()
+                .push((self.id, hits.ranges().to_vec()));
+            Ok(hits.intersect(&self.into_selection(doc)?))
+        }
+    }
+    let mut doc = Document::new("custom");
+    doc.push("abcdef").unwrap();
+    let calls = RefCell::new(Vec::new());
+    let resolved = Rc::new(RefCell::new(0));
+    let query = doc
+        .find()
+        .within(Tracked {
+            id: 1,
+            cost: 100,
+            calls: &calls,
+            resolved: resolved.clone(),
+        })
+        .within(Tracked {
+            id: 2,
+            cost: 10,
+            calls: &calls,
+            resolved: resolved.clone(),
+        });
+    assert_eq!(*resolved.borrow(), 0);
+    assert_eq!(hits(query), [1..3]);
+    assert_eq!(*resolved.borrow(), 2);
+    assert_eq!(*calls.borrow(), [(2, vec![0..6]), (1, vec![1..3])]);
+}
+
+#[test]
+fn narrowed_span_filters_agree_with_full_selections_including_points() {
+    use klause::IntoSelection;
+    let mut doc = Document::new("filter")
+        .with_layer("spans")
+        .with_layer("tags");
+    doc.push("0123456789abcdef").unwrap();
+    for start in 0..=16 {
+        for end in start..=16 {
+            let span = doc
+                .add_span(
+                    "spans",
+                    Span::from(start..end)
+                        .with_attr("kind", if start % 2 == 0 { "even" } else { "odd" }),
+                )
+                .unwrap();
+            doc.add_span("tags", Span::on_ref(&span)).unwrap();
+        }
+    }
+    let split = doc
+        .add_span(
+            "spans",
+            Span::from([0..2, 7..9, 14..16]).with_attr("kind", "even"),
+        )
+        .unwrap();
+    doc.add_span("tags", Span::on_ref(&split)).unwrap();
+    for filter in [
+        spans_in("spans"),
+        spans_in("spans").with_attr("kind", "even"),
+        spans_in("tags"),
+    ] {
+        let full = filter.clone().into_selection(&doc).unwrap();
+        for start in 0..=16 {
+            for end in start..=16 {
+                let selection = (start..end).into_selection(&doc).unwrap();
+                assert_eq!(
+                    hits(doc.find().within(start..end).within(filter.clone())),
+                    selection.intersect(&full).ranges(),
+                    "filter {filter:?} in {start}..{end}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn point_selection_order_does_not_change_when_an_index_is_warmed() {
+    let mut doc = Document::new("points").with_layer("spans");
+    doc.push("ab").unwrap();
+    doc.add_span("spans", Span::from(1..1).with_attr("kind", "point"))
+        .unwrap();
+    let query = || {
+        doc.find()
+            .within(0..1)
+            .within(1..2)
+            .within(spans_in("spans").with_attr("kind", "point"))
+    };
+    assert!(hits(query()).is_empty());
+    doc.find()
+        .within(spans_in("spans").with_attr("kind", "point"))
+        .count()
+        .unwrap();
+    assert!(hits(query()).is_empty());
+    assert_eq!(
+        hits(doc.find().within(1..1).within(0..1).within(1..2)),
+        [1..1]
+    );
+}
+
+#[test]
+fn empty_hits_do_not_hide_invalid_selections_or_distance_layers() {
+    let doc = genesis();
+    assert!(matches!(
+        doc.find()
+            .within(Vec::<Range<u32>>::new())
+            .in_layer("missing")
+            .count(),
+        Err(Error::UnknownLayer(_))
+    ));
+    assert!(matches!(
+        doc.find()
+            .within(Vec::<Range<u32>>::new())
+            .within(0..u32::MAX)
+            .count(),
+        Err(Error::OutOfRange(_))
+    ));
+    assert!(matches!(
+        doc.find()
+            .with_text("absent")
+            .followed_by("words", Distance::at_most(1, "missing"))
+            .count(),
+        Err(Error::UnknownLayer(_))
+    ));
+}
+
+#[test]
+fn position_candidates_preserve_points_absorbed_by_adjacent_ranges() {
+    let mut doc = Document::new("boundary").with_layer("spans");
+    doc.push("0123456789").unwrap();
+    doc.add_span("spans", Span::from(0..1)).unwrap();
+    doc.add_span("spans", Span::from(1..1)).unwrap();
+    for _ in 0..100 {
+        doc.add_span("spans", Span::from(8..9)).unwrap();
+    }
+    // The point at 1 was absorbed into 0..1 by selection normalization.
+    // That text range does not overlap 1..2, so no point should reappear.
+    assert!(hits(doc.find().within(1..2).in_layer("spans")).is_empty());
+    assert_eq!(hits(doc.find().within(1..1).in_layer("spans")), [1..1]);
 }
