@@ -1,5 +1,7 @@
 # Klause
 
+[![Crates.io](https://img.shields.io/crates/v/klause.svg)](https://crates.io/crates/klause)
+[![Docs.rs](https://docs.rs/klause/badge.svg)](https://docs.rs/klause)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
 Klause is a Rust library for storing, reading, and querying annotated text.
@@ -19,15 +21,14 @@ Klause keeps text and stored annotations in memory; file and database I/O belong
 
 ## Installation
 
-Klause is not published on crates.io yet. Add it as a Git dependency:
+Run `cargo add klause`, or add it to `Cargo.toml`:
 
 ```toml
 [dependencies]
-klause = { git = "https://github.com/aridinstitute/klause" }
+klause = "0.1.0"
 ```
 
-For reproducible builds, pin a commit with `rev`. Disable default features
-to build Klause with `alloc` and without `std`.
+Set `default-features = false` to build Klause with `alloc` and without `std`.
 
 ## Usage
 
