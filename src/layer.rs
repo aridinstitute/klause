@@ -382,6 +382,9 @@ impl Layer {
         self.targets.is_implicit(slot)
     }
 
+    pub(crate) fn has_between_targets(&self) -> bool {
+        self.targets.has_between()
+    }
     pub(crate) fn target_refs(&self, slot: usize) -> TargetRefs<'_> {
         if self.has_implicit_target(slot) {
             [

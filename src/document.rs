@@ -267,8 +267,11 @@ impl Document {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn replace_span(&mut self, reference: &SpanRef, span: Span) -> Result<(), Error> {
-        let location @ (layer, slot) = self.edit_location(reference)?;
+        let location = self.edit_location(reference)?;
         let parents = self.validate_target(span.target())?;
+        if self.can_stream_cascade() {
+            return self.replace_streaming(location, reference, span, parents);
+        }
         let (reachable, order) = self.dependent_order(location);
         if target_links(parents).any(|parent| reachable.contains(&parent)) {
             return Err(Error::Cycle(reference.clone()));
@@ -303,19 +306,7 @@ impl Document {
             }
         }
 
-        self.detach_target(layer, slot);
-        let stored = Arc::make_mut(&mut self.layers[layer]);
-        stored.replace_span(
-            slot,
-            reference.id(),
-            span,
-            resolved.as_ref().map(RangeSnapshot::as_slice),
-        );
-        if !stored.has_implicit_target(slot) {
-            for parent in target_links(parents) {
-                self.attach_target(parent, location);
-            }
-        }
+        self.write_replacement(location, reference, span, parents, resolved.as_ref());
         for ((layer, slot), ranges) in updates {
             Arc::make_mut(&mut self.layers[layer]).refresh_ranges(slot, ranges.as_slice());
         }
@@ -337,6 +328,10 @@ impl Document {
     /// ```
     pub fn remove_span(&mut self, reference: &SpanRef) -> Result<(), Error> {
         let location = self.edit_location(reference)?;
+        if self.can_stream_cascade() {
+            self.remove_streaming(location);
+            return Ok(());
+        }
         let (removed, order) = self.dependent_order(location);
         for &(layer, _) in &order {
             if self.layers[layer].is_read_only() {
@@ -356,6 +351,10 @@ impl Document {
         }
         for (layer, parent) in affected {
             let dependents = &mut Arc::make_mut(&mut self.layers[layer]).dependents;
+            if removed.contains(&parent) {
+                dependents.remove(&parent);
+                continue;
+            }
             let children = dependents.get_mut(&parent).unwrap();
             children.retain(|&slot| !removed.contains(&(layer, slot)));
             if children.is_empty() {
@@ -1139,6 +1138,105 @@ impl Document {
             .map(|target| target.map(|(layer, id)| self.span_location_by_id(layer, id).unwrap()))
     }
 
+    // With one parent per span, every dependent inherits the edited span's
+    // ranges, and there is only one path from that span to each dependent.
+    // If any layer could need validation, keep the preflight before writing.
+    fn can_stream_cascade(&self) -> bool {
+        self.layers
+            .iter()
+            .all(|layer| !layer.is_frozen() && !layer.has_between_targets())
+    }
+
+    fn write_replacement(
+        &mut self,
+        location @ (layer, slot): Location,
+        reference: &SpanRef,
+        span: Span,
+        parents: TargetLocations,
+        resolved: Option<&RangeSnapshot>,
+    ) {
+        self.detach_target(layer, slot);
+        let stored = Arc::make_mut(&mut self.layers[layer]);
+        stored.replace_span(
+            slot,
+            reference.id(),
+            span,
+            resolved.map(RangeSnapshot::as_slice),
+        );
+        if !stored.has_implicit_target(slot) {
+            for parent in target_links(parents) {
+                self.attach_target(parent, location);
+            }
+        }
+    }
+
+    fn replace_streaming(
+        &mut self,
+        location: Location,
+        reference: &SpanRef,
+        span: Span,
+        parents: TargetLocations,
+    ) -> Result<(), Error> {
+        // The *existing* graph has one parent per span, even if the
+        // replacement introduces the first Between target.
+        for parent in target_links(parents) {
+            let mut cursor = Some(parent);
+            while let Some(target) = cursor {
+                if target == location {
+                    return Err(Error::Cycle(reference.clone()));
+                }
+                cursor = self.targets_at(target)[0];
+            }
+        }
+        let resolved = resolve_target_ranges(parents, |loc| self.ranges_at(loc))?;
+        let replacement = match span.target() {
+            Target::Text(ranges) => ranges.as_slice(),
+            _ => resolved.as_ref().unwrap().as_slice(),
+        };
+        let changed = replacement != self.ranges_at(location);
+        self.write_replacement(location, reference, span, parents, resolved.as_ref());
+
+        if changed {
+            let mut pending = Vec::new();
+            self.extend_dependents(location.0, location.1, &mut pending);
+            if !pending.is_empty() {
+                let ranges = RangeSnapshot::new(self.ranges_at(location));
+                while let Some((layer, slot)) = pending.pop() {
+                    Arc::make_mut(&mut self.layers[layer]).refresh_ranges(slot, ranges.as_slice());
+                    self.extend_dependents(layer, slot, &mut pending);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_streaming(&mut self, root: Location) {
+        // Only the root can still have a parent outside the removed subtree.
+        self.detach_target(root.0, root.1);
+        let mut pending = Vec::new();
+        let mut current = Some(root);
+        while let Some(location @ (layer, slot)) = current {
+            for index in 0..self.layers.len() {
+                let parent = &self.layers[layer];
+                let candidate = &self.layers[index];
+                if candidate.implicit_target_layer() == Some(parent.id())
+                    && let Some(child) = candidate.slot(parent.id_at(slot))
+                    && candidate.has_implicit_target(child)
+                {
+                    pending.push((index, child));
+                }
+                if candidate.dependents.contains_key(&location) {
+                    let children = Arc::make_mut(&mut self.layers[index])
+                        .dependents
+                        .remove(&location)
+                        .unwrap();
+                    pending.extend(children.into_iter().map(|child| (index, child)));
+                }
+            }
+            Arc::make_mut(&mut self.layers[layer]).remove_span(slot);
+            current = pending.pop();
+        }
+    }
     // Reverse DFS postorder visits each reachable dependent after both of its
     // affected parents. Keep the traversal iterative for deep target chains.
     fn dependent_order(&self, root: Location) -> (BTreeSet<Location>, Vec<Location>) {
@@ -2197,5 +2295,49 @@ mod tests {
         assert_eq!(snapshot.ranges(&overlay).unwrap(), [0..6]);
         assert_eq!(snapshot.ranges(&tag).unwrap(), [0..2]);
         assert!(snapshot.span(&first).is_some());
+    }
+
+    #[test]
+    fn single_target_cascades_resume_after_the_last_between_is_removed_or_replaced() {
+        let (mut doc, first, second, tag) = fixture();
+        assert!(doc.can_stream_cascade());
+
+        // The first Between can itself be a replacement, so check both new
+        // endpoints for cycles even if the existing graph has only single targets.
+        let next_tag = doc.add_span("tags", Span::from(3..6)).unwrap();
+        assert!(matches!(
+            doc.replace_span(&next_tag, Span::between(tag.clone(), next_tag.clone())),
+            Err(Error::Cycle(r)) if r == next_tag
+        ));
+        let run = doc
+            .add_span("tags", Span::between(first.clone(), second.clone()))
+            .unwrap();
+        assert!(!doc.can_stream_cascade());
+        doc.remove_span(&run).unwrap();
+        assert!(doc.can_stream_cascade());
+
+        doc.replace_span(&next_tag, Span::between(first.clone(), second))
+            .unwrap();
+        assert!(!doc.can_stream_cascade());
+        doc.replace_span(&next_tag, Span::on_ref(&tag)).unwrap();
+        assert!(doc.can_stream_cascade());
+
+        // The direct cascade must still isolate a shared snapshot and clean
+        // up both the implicit and explicit reverse links when it removes spans.
+        let snapshot = doc.clone();
+        doc.replace_span(&first, Span::from(2..2)).unwrap();
+        assert_eq!(
+            doc.ranges(&next_tag).unwrap(),
+            core::slice::from_ref(&(2..2))
+        );
+        assert_eq!(
+            snapshot.ranges(&next_tag).unwrap(),
+            core::slice::from_ref(&(0..2))
+        );
+        doc.remove_span(&first).unwrap();
+        assert!(doc.span(&tag).is_none());
+        assert!(doc.span(&next_tag).is_none());
+        assert!(doc.layer("tags").unwrap().dependents.is_empty());
+        assert!(snapshot.span(&next_tag).is_some());
     }
 }

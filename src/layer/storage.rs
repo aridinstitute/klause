@@ -247,6 +247,9 @@ impl Targets {
         self.between.get(&(slot as u32))
     }
 
+    pub(super) fn has_between(&self) -> bool {
+        !self.between.is_empty()
+    }
     pub(super) fn set_between(
         &mut self,
         slot: usize,

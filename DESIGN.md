@@ -710,6 +710,9 @@ bible.find().in_span("books", "GEN").in_layer("highlights").expand_to("verses").
   Parallel layers can infer same-ID links in both directions. Explicit targets use sparse reverse edges in the
   child's layer; targets in another layer never need to mutate that layer. Replacement refreshes downstream range
   caches and removal cascades to dependent spans.
+  Documents without frozen layers or live `Between` targets can stream single-target cascades. Each dependent
+  inherits the same ranges, and removal can drop an entire reverse list. Other documents preflight edits to
+  preserve atomicity and account for dependents that can be reached through both endpoints.
 - **Position index.** A balanced interval index sorted by start, with each subtree's maximum end. Each resolved range
   gets an entry, and lookups deduplicate matching slots.
 - **Attribute index.** A per-layer map from attribute keys and exact values to matching slots. One indexed exact

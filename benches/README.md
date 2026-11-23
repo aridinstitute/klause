@@ -65,6 +65,19 @@ Darwin, 14 logical CPUs, 48 GB RAM. Criterion point estimates:
 
 Removing 100,000 tags and their target: **10.9 ms**.
 
+### Single-target cascade fast path
+
+Apple M4 Pro, release build, 10 samples with a 1-second warmup and a 3-second
+measurement target. These means compare the release branch, the initial
+`Between` and copy-on-write PR, and the same PR with the fast path:
+
+| Operation | Release branch | Initial PR | Fast path |
+| :-- | --: | --: | --: |
+| Replace word and update two dependents (1,000 words) | 92 ns | 263 ns | 103 ns |
+| Replace word and update two dependents (790,000 words) | 124 ns | 310 ns | 134 ns |
+| Remove word and two dependents (1,000 words) | 1.19 µs | 1.35 µs | 1.16 µs |
+| Remove word and 100,000 dependents | 5.15 ms | 13.63 ms | 5.01 ms |
+
 The existing creation suite was also run:
 
 ```sh
