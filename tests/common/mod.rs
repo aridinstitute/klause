@@ -165,7 +165,7 @@ impl SpanSource for Highlights {
             .filter(|span| match span.target() {
                 Target::Text(ranges) => ranges.iter().any(touches),
                 // Klause resolves targets; a database of highlights can't.
-                Target::Span(_) => true,
+                Target::Span(_) | Target::Between(..) => true,
             })
             .cloned()
             .collect())

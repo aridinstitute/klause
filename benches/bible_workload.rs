@@ -1,7 +1,7 @@
 use std::{
     hint::black_box,
     process::{self, Command},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use criterion::{BatchSize, Criterion};
@@ -14,6 +14,19 @@ use fixture::{
     VERSES, WORDS, XREFS,
 };
 
+const OVERLAY_SPANS: usize = 10_000;
+
+fn insert_overlay(doc: &mut Document) {
+    for i in 0..OVERLAY_SPANS {
+        let start = (i * (WORDS - 2) / OVERLAY_SPANS) as u64;
+        doc.add_span(
+            "overlay",
+            Span::between(span_id("words", start), span_id("words", start + 2))
+                .with_attr("color", "yellow"),
+        )
+        .unwrap();
+    }
+}
 fn chapter(doc: &Document) -> Passage {
     doc.get_passage(span_id("chapters", CHAPTER)).unwrap()
 }
@@ -133,6 +146,14 @@ fn bible_workload(c: &mut Criterion) {
     group.bench_function("folded_phrase_to_verses", |b| {
         b.iter(|| black_box(combined()))
     });
+    let base = doc.freeze_layers();
+    group.bench_function("overlay_insert_10000", |b| {
+        b.iter_batched_ref(
+            || base.clone().with_layer("overlay"),
+            insert_overlay,
+            BatchSize::PerIteration,
+        );
+    });
     group.finish();
 }
 
@@ -158,7 +179,29 @@ fn report_rss(label: &str) {
     );
 }
 
+fn overlay_rss() {
+    let base = Rows::new().build().freeze_layers();
+    let mut doc = base.clone().with_layer("overlay");
+    report_rss("Frozen base and empty overlay");
+    let start = Instant::now();
+    insert_overlay(&mut doc);
+    let elapsed = start.elapsed();
+    report_rss("Frozen base and 10,000 overlay spans");
+    assert_eq!(doc.layer("overlay").unwrap().spans().count(), OVERLAY_SPANS);
+    for layer in base.layers() {
+        assert!(
+            std::ptr::eq(layer, doc.layer(layer.id()).unwrap()),
+            "copied {}",
+            layer.id()
+        );
+    }
+    println!("Inserted {OVERLAY_SPANS} spans in {elapsed:.2?}; all base layers still shared");
+}
 fn main() {
+    if std::env::args().any(|arg| arg == "--overlay-rss") {
+        overlay_rss();
+        return;
+    }
     if std::env::args().any(|arg| arg == "--rss") {
         report_rss("Before loading");
         let (doc, destination) = {

@@ -4,7 +4,7 @@ use core::{
     ops::{Range, RangeFrom, RangeFull},
 };
 
-use crate::document::{Document, Error, Span, SpanId, SpanRef, Target, Value};
+use crate::document::{Document, Error, Span, SpanId, SpanRef, Value};
 use crate::layer::{IdRef, Layer};
 
 /// A set of text ranges in a document, represented as sorted, non-overlapping byte ranges.
@@ -439,14 +439,13 @@ impl<'a> SpanView<'a> {
         }
     }
 
-    fn target(self) -> Option<(&'a str, IdRef<'a>)> {
+    fn targets(self) -> impl Iterator<Item = (&'a str, IdRef<'a>)> {
         match self {
-            Self::Borrowed(span) => match span.target() {
-                Target::Span(reference) => Some((reference.layer(), reference.id().into())),
-                Target::Text(_) => None,
-            },
-            Self::Stored(layer, slot) => layer.target_at(slot),
+            Self::Borrowed(span) => span.target().target_refs(),
+            Self::Stored(layer, slot) => layer.target_refs(slot),
         }
+        .into_iter()
+        .flatten()
     }
 
     pub(crate) fn values(self, key: &str) -> impl Iterator<Item = &'a Value> {
@@ -537,7 +536,7 @@ impl SpanFilter {
             Condition::WithKey(key) => span.values(key).next().is_some(),
             Condition::WithoutKey(key) => span.values(key).next().is_none(),
             Condition::WithId(id) => span.id() == Some(id.into()),
-            Condition::Targeting(target_filter) => span.target().is_some_and(|(layer, id)| {
+            Condition::Targeting(target_filter) => span.targets().any(|(layer, id)| {
                 doc.span_view(layer, id)
                     .is_some_and(|target| target_filter.matches(doc, target, layer))
             }),
@@ -659,7 +658,8 @@ impl SpanFilter {
         self
     }
 
-    /// Restricts matching to spans whose target matches another filter.
+    /// Restricts matching to spans whose target matches another filter. For a
+    /// [`crate::Target::Between`] target, either endpoint can match.
     ///
     /// # Example
     ///

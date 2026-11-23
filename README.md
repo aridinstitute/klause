@@ -12,7 +12,7 @@ Klause keeps text and stored annotations in memory; file and database I/O belong
 
 - **Document** — An ID, metadata, append-only UTF-8 text, and named annotation layers. Positions are document-local byte offsets into NFC-normalized text.
 - **Corpus** — Documents with unique IDs; queries run independently on the selected documents and can aggregate the results.
-- **Span** — An annotation with an ID, attributes, and a target: one or more text ranges (including points), or another span in the same document.
+- **Span** — An annotation with an ID, attributes, and a target: text ranges (including points), another span, or a run between two spans.
 - **Layer** — A named group of spans. A stored layer owns its spans; a source layer reads them live from application storage.
 - **Value** — A scalar: null, bool, integer, float, or string. An attribute key can hold multiple values.
 - **Selection** — A sorted set of text ranges that can be unioned, intersected, and subtracted.
@@ -56,6 +56,36 @@ Passages own their annotation data and can outlive the document borrow. To load
 application-managed annotations on demand, add a source layer with
 `Layer::source` and implement `SpanSource`.
 
+### Anchoring an annotation to stable IDs
+
+If the words in a document have stable IDs, store the IDs of the first and last
+word instead of storing byte offsets:
+
+```rust
+use klause::{Span, span_id};
+
+let highlight = Span::between(span_id("words", 3_u64), span_id("words", 5_u64))
+    .with_attr("color", "yellow");
+```
+
+The span covers both endpoints and all text between them. The endpoints must
+be in the same layer, in text order, and must not overlap.
+
+### Freezing a base document
+
+Freeze the stored layers after import if they won't be edited. Clones share
+the frozen base, and edits to an overlay leave that base untouched:
+
+```rust
+let base = doc.freeze_layers();
+let mut editable = base.clone().with_layer("highlights");
+editable.add_span("highlights", highlight)?;
+let snapshot = editable.clone();
+```
+
+Readers can share a snapshot across threads. Later edits don't change the
+snapshot's stored spans, but source layers still read live application data.
+
 ### Querying multiple documents
 
 ```rust
@@ -93,6 +123,7 @@ cargo test
 cargo check --no-default-features
 cargo bench --bench bible_workload
 cargo bench --bench bible_workload -- --rss
+cargo bench --bench bible_workload -- --overlay-rss
 ```
 
 The [benchmark notes](benches/README.md) cover the full synthetic Bible workload,

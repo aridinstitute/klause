@@ -3,7 +3,7 @@
 //! Klause stores and queries annotated text.
 //!
 //! A [`Document`] holds text and annotation layers. A [`Span`] is an annotation
-//! that targets text ranges or another span; a [`Selection`] is just a set of
+//! that targets text ranges, another span, or a run of spans; a [`Selection`] is just a set of
 //! text ranges. A [`Passage`] gives you the text and annotations for one range.
 //! A [`Corpus`] runs the same query across multiple documents and aggregates
 //! counts without mixing their byte offsets.

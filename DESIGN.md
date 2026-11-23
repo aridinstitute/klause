@@ -160,23 +160,30 @@ layer in `doc.layers()`, `layer.id()`, `layer.name()`, `layer.attrs()`, `layer.i
 
 ### Targets
 
-A span targets either text or another span.
+A span targets text, another span, or a run of spans.
 
 ```rust
-use klause::Span;
+use klause::{Span, span_id};
 
 Span::from(0..3)                              // text
 Span::from([61..70, 75..83])                  // several ranges, read as one unit
 Span::from(48..48)                            // a point
 Span::on("words", 1_003_015_003_u64)          // another span, by layer and ID
 Span::on_ref(&span_ref)                       // another span, by SpanRef
+Span::between(span_id("words", 3_u64), span_id("words", 5_u64)) // run of spans
 ```
 
 - `Span::from` takes a range, an array or `Vec` of ranges, or a range returned by `push`. Ranges are sorted, and
   ranges that overlap or meet end to start are merged into one.
 - A span that targets another span follows it: its ranges are always that span's current ranges. Morphology tags
   target word spans this way.
-- A span can only target a span that already exists, so chains of targets never form a cycle.
+- `Span::between` resolves to a single range from the first endpoint's first start to the last endpoint's last end,
+  including any intervening text. Both endpoints must have ranges and belong to the same layer. The first endpoint
+  must end at or before the last one starts; span ID order does not matter.
+- Replacing an endpoint updates its dependents. If the edit would make a dependent's endpoints invalid, the edit is
+  rejected without changing any spans. Removing either endpoint removes the dependent span.
+- Targets must already exist, and replacements that would introduce cycles through any target are rejected.
+  A source span with a missing endpoint is skipped. `SpanFilter::targeting` matches a run through either endpoint.
 - There is no link target. Model a cross-reference as an ordinary span targeting its local origin with a destination
   identifier stored as an attribute, and resolve that destination in application code.
 
@@ -186,6 +193,7 @@ use klause::Target;
 match span.target() {
     Target::Text(ranges) => { /* &[Range<u32>] */ }
     Target::Span(r)      => { doc.span(r); }
+    Target::Between(first, last) => { (doc.span(first), doc.span(last)); }
 }
 
 doc.ranges(&span_ref);        // Option<&[Range<u32>]>: the span's ranges, following targets
@@ -270,6 +278,19 @@ doc.layers();                             // in the order they were added
 
 Layer IDs are any non-empty string, and `&str` converts to `Layer::new(id)`.
 
+### Frozen layers and snapshots
+
+`Document::clone` shares the text, layers, and span sources. An edit copies only
+the stored layers it changes if those layers are shared; a snapshot keeps its
+original stored text and spans. Source layers still read live data in every
+snapshot. A document can be shared with concurrent readers (`Send + Sync`).
+
+Use `doc.freeze_layers()` to build the indexes and make all current stored
+layers read-only, or `doc.freeze_layer(id)?` to freeze just one. Add an editable
+layer for overlays; its spans can target frozen spans without modifying the
+base. Direct span edits to frozen layers return `ReadOnlyLayer`. An edit in
+another layer that would remove or move a frozen dependent is also rejected
+before changing anything.
 ## Selectors and selections
 
 ### Selectors
@@ -677,7 +698,7 @@ bible.find().in_span("books", "GEN").in_layer("highlights").expand_to("verses").
 ### Storage
 
 - **Text.** An `Arc<String>`. `push` uses `Arc::make_mut`, so it copies the text only while a passage still shares
-  the old one. Passages hold the `Arc` and their range.
+  the old one. Passages and document snapshots hold an `Arc` to the text.
 - **Spans.** Stored layers use parallel columns. A sorted vector of integer IDs maps to slots by binary search;
   only out-of-order or mixed IDs and holes need an additional slot mapping. The range column stores adjoining
   pairs of `u32` endpoints as `Range<u32>` so `ranges()` can borrow directly. Each row's offset is implicit
@@ -686,13 +707,20 @@ bible.find().in_span("books", "GEN").in_layer("highlights").expand_to("verses").
   Queries inspect columns directly. Public borrows from `span()` and `spans()` materialize spans into a lazy,
   stable-address cache; owned query results materialize only returned spans.
 - **Targets.** Text spans store their ranges once. Only spans targeting other spans cache resolved ranges.
-  Parallel layers can infer same-ID links in both directions. Other targets are interned and use sparse reverse
-  edges; replacement refreshes downstream range caches and removal cascades to dependent spans.
-- **Position index.** A balanced interval index sorted by start, with each subtree's maximum end. It is rebuilt lazily
-  after span edits on the next lookup. Each resolved range gets an entry, and lookups deduplicate matching slots.
-- **Attribute index.** A lazy per-layer map from attribute keys and exact values to matching slots. One indexed exact
-  predicate can narrow the candidates; remaining predicates run against the spans themselves. A range predicate on its
-  own scans candidates; there is no numeric-range index.
+  Parallel layers can infer same-ID links in both directions. Explicit targets use sparse reverse edges in the
+  child's layer; targets in another layer never need to mutate that layer. Replacement refreshes downstream range
+  caches and removal cascades to dependent spans.
+  Documents without frozen layers or live `Between` targets can stream single-target cascades. Each dependent
+  inherits the same ranges, and removal can drop an entire reverse list. Other documents preflight edits to
+  preserve atomicity and account for dependents that can be reached through both endpoints.
+- **Position index.** A balanced interval index sorted by start, with each subtree's maximum end. Each resolved range
+  gets an entry, and lookups deduplicate matching slots.
+- **Attribute index.** A per-layer map from attribute keys and exact values to matching slots. One indexed exact
+  predicate can narrow the candidates; remaining predicates run against the spans themselves. A range predicate on
+  its own scans candidates; there is no numeric-range index.
+- **Index lifecycle.** Under `std`, indexes use `OnceLock` and are built on first use or at freeze time. Edits
+  invalidate the affected indexes. Without `std`, edits maintain attribute postings and sorted position entries;
+  freezing compacts the position entries into the balanced interval index.
 - **Folded text.** Searches stream folded characters and keep only a pattern-sized window of original offsets.
   ASCII bypasses normalization, and non-ASCII characters use a stack buffer. There is no cache across queries.
 - **Corpus.** A `BTreeMap` indexes documents by ID. Queries run serially through the document API; there is no global
@@ -738,18 +766,14 @@ remain above budget.
 
 | Earlier design or sketch | Current implementation |
 | :-- | :-- |
-| A corpus could own shared stored/source layers and cross-document links, and accept document-qualified offsets or span refs directly. | Only documents own layers. Corpus queries apply document-local selectors to each selected document and attach IDs to results. There is no `Span::link`, `SpanRef::in_doc`, built-in persistence, or anchoring. |
+| A corpus could own shared stored/source layers and cross-document links, and accept document-qualified offsets or span refs directly. | Only documents own layers. Corpus queries apply document-local selectors to each selected document and attach IDs to results. There is no `Span::link`, `SpanRef::in_doc`, or built-in persistence. |
 | Corpus metadata filters used a dedicated `docs()` selector. | `in_documents` selects IDs and `filter_documents` accepts a predicate on `&Document`. |
 | Attribute lookup interned strings, intersected multiple indexed conditions, and binary-searched numeric ranges. | Exact-value indexes hold string keys and narrow by one exact predicate. String values are still stored on spans. Range predicates test values as `f64`, which can round large integers. |
 | Folded text would be cached and extended on append, with only `Mn` marks ignored. | Searches refold the hits on every call and ignore all Unicode marks. They lowercase each character rather than applying full Unicode case folding. Literal and folded matching also differ in handling overlapping candidates. |
 | Literal search would use `memchr` directly. | It uses `str::match_indices`; `memchr` is not a direct library dependency. |
-| Concurrent readers were described as only needing coordination with writers. | `Document` and `Corpus` are not `Sync` because lazy layer indexes use `RefCell`. Passages are `Send + Sync`. |
-
 ## Open questions
 
 1. **What `followed_by` returns.** It keeps the first part of a pair. Should there be a way to get both parts as one
    hit?
 2. **Letters and their marks.** Ranges must start and end on character boundaries. Should a range also be kept from
    separating a letter from the combining marks after it?
-3. **Concurrent access.** Should documents support simultaneous readers, and should edits produce cheap snapshots
-   so those readers can retain an older version?
