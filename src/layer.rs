@@ -1,38 +1,43 @@
-use alloc::{
-    boxed::Box,
-    collections::BTreeMap,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use core::{cell::RefCell, fmt, ops::Range};
 
-use crate::document::{Attributes, IntoValues, Span, SpanId, Value};
+use crate::document::{Attributes, IntoValues, Span, SpanId, SpanRef, Target, Value};
 use crate::source::SpanSource;
 
+mod storage;
+
+pub(crate) use storage::IdRef;
+use storage::{AttributeColumns, Ids, Rows, SpanCache, Targets};
 /// A named collection of spans, optionally populated by a read-only span source.
 pub struct Layer {
     id: String,
     name: String,
-    pub(crate) spans: Vec<Option<Span>>,
-    pub(crate) span_slots: BTreeMap<SpanId, usize>,
+    ids: Ids,
     pub(crate) next_id: Option<u64>,
-    pub(crate) resolved_ranges: Vec<Vec<Range<u32>>>,
+    // Flat pairs of u32 endpoints, stored as Range<u32> so ranges() can
+    // return a borrowed slice without a conversion or a second allocation.
+    // A row is the original target for text spans, and a cache only for references.
+    ranges: Rows<Range<u32>>,
+    targets: Targets,
+    attributes: AttributeColumns,
+    borrowed_spans: SpanCache,
     pub(crate) point_span_count: usize,
-    // Slot addresses (layer index, slot), allocated only through the last targeted slot.
-    pub(crate) dependents: Vec<Vec<(usize, usize)>>,
-    pub(crate) free_slots: Vec<usize>,
+    // Reverse edges for explicit targets only; same-ID edges can be inferred.
+    pub(crate) dependents: BTreeMap<usize, Vec<(usize, usize)>>,
+    free_slots: Vec<usize>,
+    slot_count: usize,
     attribute_index: RefCell<Option<AttributeIndex>>,
     position_index: RefCell<Option<PositionIndex>>,
     pub(crate) source: Option<Box<dyn SpanSource>>,
     attrs: Attributes,
 }
 
-type AttributeIndex = BTreeMap<String, BTreeMap<IndexedValue, Vec<usize>>>;
+type AttributeIndex = BTreeMap<(u32, u32), Vec<u32>>;
 
 struct PositionEntry {
     start: u32,
     end: u32,
-    slot: usize,
+    slot: u32,
     max_end: u32,
 }
 
@@ -46,17 +51,14 @@ struct PositionIndex {
 impl PositionIndex {
     fn build(layer: &Layer) -> Self {
         let mut entries: Vec<_> = layer
-            .span_slots
-            .values()
-            .flat_map(|&slot| {
-                layer.resolved_ranges[slot]
-                    .iter()
-                    .map(move |range| PositionEntry {
-                        start: range.start,
-                        end: range.end,
-                        slot,
-                        max_end: range.end,
-                    })
+            .slots()
+            .flat_map(|slot| {
+                layer.ranges(slot).iter().map(move |range| PositionEntry {
+                    start: range.start,
+                    end: range.end,
+                    slot: slot as u32,
+                    max_end: range.end,
+                })
             })
             .collect();
         entries.sort_unstable_by_key(|entry| (entry.start, entry.end, entry.slot));
@@ -101,34 +103,9 @@ impl PositionIndex {
             range.start < range.end && entry.start < range.end && range.start < entry.end
         };
         if touches {
-            slots.push(entry.slot);
+            slots.push(entry.slot as usize);
         }
         Self::lookup(&entries[mid + 1..], range, include_boundaries, slots);
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum IndexedValue {
-    Null,
-    Bool(bool),
-    Int(i64),
-    Float(u64),
-    Str(String),
-}
-
-impl From<&Value> for IndexedValue {
-    fn from(value: &Value) -> Self {
-        match value {
-            Value::Null => Self::Null,
-            Value::Bool(value) => Self::Bool(*value),
-            Value::Int(value) => Self::Int(*value),
-            Value::Float(value) => Self::Float(if *value == 0.0 {
-                0.0_f64.to_bits()
-            } else {
-                value.to_bits()
-            }),
-            Value::Str(value) => Self::Str(value.clone()),
-        }
     }
 }
 
@@ -137,7 +114,7 @@ impl fmt::Debug for Layer {
         f.debug_struct("Layer")
             .field("id", &self.id)
             .field("name", &self.name)
-            .field("spans", &self.spans)
+            .field("span_count", &self.span_count())
             .field("source", &self.is_source())
             .field("attrs", &self.attrs)
             .finish()
@@ -159,13 +136,16 @@ impl Layer {
         Self {
             name: id.clone(),
             id,
-            spans: Vec::new(),
-            span_slots: BTreeMap::new(),
+            ids: Ids::default(),
             next_id: Some(1),
-            resolved_ranges: Vec::new(),
+            ranges: Rows::default(),
+            targets: Targets::default(),
+            attributes: AttributeColumns::default(),
+            borrowed_spans: SpanCache::default(),
             point_span_count: 0,
-            dependents: Vec::new(),
+            dependents: BTreeMap::new(),
             free_slots: Vec::new(),
+            slot_count: 0,
             attribute_index: RefCell::new(None),
             position_index: RefCell::new(None),
             source: None,
@@ -300,15 +280,166 @@ impl Layer {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn spans(&self) -> impl Iterator<Item = &Span> {
-        self.slots_in_position_order()
-            .into_iter()
-            .map(|slot| self.spans[slot].as_ref().unwrap())
+        Spans {
+            layer: self,
+            slots: None,
+        }
+    }
+
+    pub(crate) fn span_count(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub(crate) fn slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.ids.slots()
+    }
+
+    pub(crate) fn slot(&self, id: IdRef<'_>) -> Option<usize> {
+        self.ids.slot(id)
+    }
+
+    pub(crate) fn id_at(&self, slot: usize) -> IdRef<'_> {
+        self.ids.id(slot)
+    }
+
+    pub(crate) fn ranges(&self, slot: usize) -> &[Range<u32>] {
+        self.ranges.get(slot)
+    }
+
+    pub(crate) fn implicit_target_layer(&self) -> Option<&str> {
+        self.targets.implicit_layer()
+    }
+
+    pub(crate) fn has_implicit_target(&self, slot: usize) -> bool {
+        self.targets.is_implicit(slot)
+    }
+
+    pub(crate) fn explicit_target(&self, slot: usize) -> Option<&SpanRef> {
+        self.targets.explicit(slot)
+    }
+
+    pub(crate) fn target_at(&self, slot: usize) -> Option<(&str, IdRef<'_>)> {
+        if self.has_implicit_target(slot) {
+            Some((self.implicit_target_layer().unwrap(), self.id_at(slot)))
+        } else {
+            self.explicit_target(slot)
+                .map(|r| (r.layer(), r.id().into()))
+        }
+    }
+
+    pub(crate) fn materialize(&self, slot: usize) -> Span {
+        let target = self.target_at(slot).map_or_else(
+            || Target::Text(self.ranges(slot).to_vec()),
+            |(layer, id)| Target::Span(SpanRef::new(layer, SpanId::from(id))),
+        );
+        Span {
+            id: Some(self.id_at(slot).into()),
+            target,
+            attrs: Attributes::from_pairs(self.attributes.attrs(slot)),
+        }
+    }
+
+    pub(crate) fn borrowed_span(&self, slot: usize) -> &Span {
+        self.borrowed_spans
+            .get_or_init(slot, || self.materialize(slot))
+    }
+
+    pub(crate) fn attr_key(&self, key: &str) -> Option<u32> {
+        self.attributes.key_code(key)
+    }
+
+    pub(crate) fn values(&self, slot: usize, key: u32) -> impl Iterator<Item = &Value> {
+        self.attributes.values(slot, key)
+    }
+
+    pub(crate) fn insert_span(
+        &mut self,
+        id: SpanId,
+        span: Span,
+        resolved: Option<&[Range<u32>]>,
+    ) -> usize {
+        if let SpanId::Int(value) = id
+            && self.next_id.is_some_and(|next| value >= next)
+        {
+            self.next_id = value.checked_add(1);
+        }
+        let slot = self.free_slots.pop().unwrap_or(self.slot_count);
+        let _ = u32::try_from(slot).expect("layer exceeds u32::MAX slots");
+        self.write_span(slot, (&id).into(), span, resolved, false);
+        self.ids.insert(id, slot);
+        if slot == self.slot_count {
+            self.slot_count += 1;
+        }
+        slot
+    }
+
+    pub(crate) fn replace_span(
+        &mut self,
+        slot: usize,
+        id: &SpanId,
+        span: Span,
+        resolved: Option<&[Range<u32>]>,
+    ) {
+        self.borrowed_spans.remove(slot);
+        self.write_span(slot, id.into(), span, resolved, true);
+    }
+
+    fn write_span(
+        &mut self,
+        slot: usize,
+        id: IdRef<'_>,
+        span: Span,
+        resolved: Option<&[Range<u32>]>,
+        replacing: bool,
+    ) {
+        let target = match span.target {
+            Target::Text(ranges) => {
+                self.write_ranges(slot, ranges.into_iter(), replacing);
+                None
+            }
+            Target::Span(reference) => {
+                self.write_ranges(slot, resolved.unwrap().iter().cloned(), replacing);
+                Some(reference)
+            }
+        };
+        self.targets.set(slot, id, self.ids.len() == 0, target);
+        self.attributes.set(slot, span.attrs.into_groups());
+        self.attribute_index.get_mut().take();
+    }
+
+    pub(crate) fn refresh_ranges(&mut self, slot: usize, ranges: &[Range<u32>]) {
+        self.write_ranges(slot, ranges.iter().cloned(), true);
+    }
+
+    fn write_ranges(
+        &mut self,
+        slot: usize,
+        ranges: impl ExactSizeIterator<Item = Range<u32>>,
+        replacing: bool,
+    ) {
+        if replacing {
+            self.point_span_count -= usize::from(self.ranges(slot).iter().any(Range::is_empty));
+        }
+        self.ranges.set(slot, ranges);
+        self.point_span_count += usize::from(self.ranges(slot).iter().any(Range::is_empty));
+        self.position_index.get_mut().take();
+    }
+
+    pub(crate) fn remove_span(&mut self, slot: usize) {
+        self.point_span_count -= usize::from(self.ranges(slot).iter().any(Range::is_empty));
+        self.ids.remove(slot, &mut self.next_id);
+        self.targets.remove(slot);
+        self.borrowed_spans.remove(slot);
+        self.attribute_index.get_mut().take();
+        self.position_index.get_mut().take();
+        // Leave the packed rows in place for reuse; only live IDs expose them.
+        self.free_slots.push(slot);
     }
 
     pub(crate) fn slots_in_position_order(&self) -> Vec<usize> {
-        let mut slots: Vec<usize> = self.span_slots.values().copied().collect();
+        let mut slots: Vec<usize> = self.slots().collect();
         slots.sort_by_key(|&slot| {
-            self.resolved_ranges[slot]
+            self.ranges(slot)
                 .first()
                 .map_or(u32::MAX, |range| range.start)
         });
@@ -319,28 +450,14 @@ impl Layer {
         self.source.as_deref()
     }
 
-    pub(crate) fn invalidate_attribute_index(&mut self) {
-        self.attribute_index.get_mut().take();
-    }
-
-    pub(crate) fn invalidate_position_index(&mut self) {
-        self.position_index.get_mut().take();
-    }
-
     pub(crate) fn touching_slots(&self, range: &Range<u32>) -> Vec<usize> {
         let mut slots = self.position_slots(range, false);
         // Match spans() ordering, including ID order for equal starts.
         slots.sort_unstable_by(|&a, &b| {
-            self.resolved_ranges[a][0]
+            self.ranges(a)[0]
                 .start
-                .cmp(&self.resolved_ranges[b][0].start)
-                .then_with(|| {
-                    self.spans[a]
-                        .as_ref()
-                        .unwrap()
-                        .id()
-                        .cmp(&self.spans[b].as_ref().unwrap().id())
-                })
+                .cmp(&self.ranges(b)[0].start)
+                .then_with(|| self.ids.compare(a, b))
         });
         slots
     }
@@ -360,55 +477,42 @@ impl Layer {
     }
 
     pub(crate) fn estimated_matching_count(&self, key: &str, value: &Value) -> usize {
-        let index = self.attribute_index.borrow();
-        let Some(index) = index.as_ref() else {
-            return self.span_slots.len();
-        };
-        let Some(values) = index.get(key) else {
+        let Some(key) = self.attr_key(key) else {
             return 0;
         };
-        indexed_values_for(value)
-            .iter()
-            .filter_map(|value| values.get(value))
+        let index = self.attribute_index.borrow();
+        let Some(index) = index.as_ref() else {
+            return self.span_count();
+        };
+        self.attributes
+            .equal_codes(value)
+            .filter_map(|value| index.get(&(key, value)))
             .map(Vec::len)
             .sum()
     }
 
     pub(crate) fn matching_slots(&self, key: &str, value: &Value) -> Vec<usize> {
-        let mut index = self.attribute_index.borrow_mut();
-        if index.is_none() {
-            let mut built = AttributeIndex::new();
-            for (&slot, span) in self
-                .span_slots
-                .values()
-                .map(|slot| (slot, self.spans[*slot].as_ref().unwrap()))
-            {
-                let mut seen = Vec::new();
-                for (attr, attr_value) in span.attrs() {
-                    let key = (attr.to_string(), IndexedValue::from(attr_value));
-                    if !seen.contains(&key) {
-                        seen.push(key);
-                    }
-                }
-                for (attr, attr_value) in seen {
-                    built
-                        .entry(attr)
-                        .or_default()
-                        .entry(attr_value)
-                        .or_default()
-                        .push(slot);
-                }
-            }
-            *index = Some(built);
-        }
-
-        let Some(values) = index.as_ref().and_then(|index| index.get(key)) else {
+        let Some(key) = self.attr_key(key) else {
             return Vec::new();
         };
+        let mut index = self.attribute_index.borrow_mut();
+        let index = index.get_or_insert_with(|| {
+            let mut built = AttributeIndex::new();
+            for slot in self.slots() {
+                for &pair in self.attributes.codes(slot) {
+                    let matching = built.entry(pair).or_default();
+                    if matching.last() != Some(&(slot as u32)) {
+                        matching.push(slot as u32);
+                    }
+                }
+            }
+            built
+        });
+
         let mut slots = Vec::new();
-        for indexed_value in indexed_values_for(value) {
-            if let Some(matches) = values.get(&indexed_value) {
-                slots.extend_from_slice(matches);
+        for code in self.attributes.equal_codes(value) {
+            if let Some(matches) = index.get(&(key, code)) {
+                slots.extend(matches.iter().map(|&slot| slot as usize));
             }
         }
         slots.sort_unstable();
@@ -417,31 +521,31 @@ impl Layer {
     }
 }
 
-fn indexed_values_for(value: &Value) -> Vec<IndexedValue> {
-    match value {
-        Value::Int(value) => {
-            let mut keys = alloc::vec![IndexedValue::Int(*value)];
-            let float = *value as f64;
-            if float >= i64::MIN as f64 && float < -(i64::MIN as f64) && float as i64 == *value {
-                keys.push(IndexedValue::Float(float.to_bits()));
-            }
-            keys
-        }
-        Value::Float(value) => {
-            let mut keys = alloc::vec![IndexedValue::Float(if *value == 0.0 {
-                0.0_f64.to_bits()
-            } else {
-                value.to_bits()
-            })];
-            if value.is_finite() && *value >= i64::MIN as f64 && *value < -(i64::MIN as f64) {
-                let integer = *value as i64;
-                if integer as f64 == *value {
-                    keys.push(IndexedValue::Int(integer));
-                }
-            }
-            keys
-        }
-        _ => alloc::vec![IndexedValue::from(value)],
+struct Spans<'a> {
+    layer: &'a Layer,
+    slots: Option<alloc::vec::IntoIter<usize>>,
+}
+
+impl<'a> Iterator for Spans<'a> {
+    type Item = &'a Span;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.slots
+            .get_or_insert_with(|| self.layer.slots_in_position_order().into_iter())
+            .next()
+            .map(|slot| self.layer.borrowed_span(slot))
+    }
+
+    fn count(self) -> usize {
+        self.size_hint().0
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self
+            .slots
+            .as_ref()
+            .map_or_else(|| self.layer.span_count(), ExactSizeIterator::len);
+        (len, Some(len))
     }
 }
 
@@ -486,9 +590,8 @@ mod tests {
                 assert_eq!(
                     layer.point_span_count,
                     layer
-                        .span_slots
-                        .values()
-                        .filter(|&&slot| layer.resolved_ranges[slot].iter().any(Range::is_empty))
+                        .slots()
+                        .filter(|&slot| layer.ranges(slot).iter().any(Range::is_empty))
                         .count()
                 );
             }

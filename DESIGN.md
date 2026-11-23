@@ -678,10 +678,16 @@ bible.find().in_span("books", "GEN").in_layer("highlights").expand_to("verses").
 
 - **Text.** An `Arc<String>`. `push` uses `Arc::make_mut`, so it copies the text only while a passage still shares
   the old one. Passages hold the `Arc` and their range.
-- **Spans.** Each stored layer keeps its spans in a `Vec` indexed by a slot number, with a map from `SpanId` to
-  slot. Each slot also caches the span's resolved ranges, so reading never walks target chains.
-- **Targets.** A reverse map from each span to the spans that target it. `replace_span` uses it to update the cached
-  ranges of every span downstream; `remove_span` uses it to cascade.
+- **Spans.** Stored layers use parallel columns. A sorted vector of integer IDs maps to slots by binary search;
+  only out-of-order or mixed IDs and holes need an additional slot mapping. The range column stores adjoining
+  pairs of `u32` endpoints as `Range<u32>` so `ranges()` can borrow directly. Each row's offset is implicit
+  while widths are uniform. Attributes are flat pairs of interned key and value codes, with dictionaries per layer.
+  A typical single-range word uses 16 bytes of column data; a same-ID morphology span with two attributes uses 32.
+  Queries inspect columns directly. Public borrows from `span()` and `spans()` materialize spans into a lazy,
+  stable-address cache; owned query results materialize only returned spans.
+- **Targets.** Text spans store their ranges once. Only spans targeting other spans cache resolved ranges.
+  Parallel layers can infer same-ID links in both directions. Other targets are interned and use sparse reverse
+  edges; replacement refreshes downstream range caches and removal cascades to dependent spans.
 - **Position index.** A balanced interval index sorted by start, with each subtree's maximum end. It is rebuilt lazily
   after span edits on the next lookup. Each resolved range gets an entry, and lookups deduplicate matching slots.
 - **Attribute index.** A lazy per-layer map from attribute keys and exact values to matching slots. One indexed exact

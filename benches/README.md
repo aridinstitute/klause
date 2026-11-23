@@ -341,3 +341,26 @@ High-cardinality counts now use a per-query hash map (`BTreeMap` without
 Its 66-document value count was 23.1 ms versus the earlier 22.36 ms.
 Folded search now streams matches with pattern-sized scratch storage and no
 persistent cache. Verse materialization was not changed.
+
+### Compact layer storage
+
+Same synthetic fixture and release settings. The RSS run drops the fixture rows
+before sampling. Timing estimates below are from paired Criterion `--quick`
+runs and indicate direction and scale, not statistical significance.
+
+| Operation | Before | After |
+| :-- | --: | --: |
+| Loaded RSS, before indexes | 765.1 MB | 297.8 MB |
+| RSS after chapter, verb, and reverse-reference queries | 946.3 MB | 349.1 MB |
+| Build through first chapter | 672 ms | 737 ms |
+| Cold chapter passage | 47.3 ms | 19.0 ms |
+| Warm chapter passage | 220 µs | 265 µs |
+| Cold verb selection | 155 ms | 35.3 ms |
+| Warm verb selection | 8.81 ms | 1.59 ms |
+| Strong’s counts | 36.6 ms | 23.3 ms |
+| Warm reverse-reference lookup | 2.34 ms | 232 µs |
+
+A word uses 16 bytes of column data (ID and range); a same-ID morphology span
+uses 32 (ID, resolved range, and two attribute pairs). These figures omit
+dictionary entries, spare vector capacity, auxiliary indexes, and any spans
+materialized for borrowed public reads.
