@@ -1,4 +1,11 @@
-use alloc::{borrow::Cow, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 use core::{fmt, ops::Range};
 use unicode_normalization::UnicodeNormalization;
 
@@ -196,7 +203,7 @@ impl Document {
         if self.layers[index].is_source() {
             return Err(Error::ReadOnlyLayer(layer.into()));
         }
-        let parent = self.target_location(span.target())?;
+        let parents = self.validate_target(span.target())?;
         let stored = &self.layers[index];
         let id = span
             .id
@@ -206,12 +213,13 @@ impl Document {
         if stored.slot((&id).into()).is_some() {
             return Err(Error::DuplicateId(reference));
         }
-        let resolved =
-            parent.map(|(layer, slot)| RangeSnapshot::new(self.layers[layer].ranges(slot)));
+        let resolved = resolve_target_ranges(parents, |loc| self.ranges_at(loc))?;
         let stored = &mut self.layers[index];
         let slot = stored.insert_span(id, span, resolved.as_ref().map(RangeSnapshot::as_slice));
-        if let Some(parent) = parent.filter(|_| !stored.has_implicit_target(slot)) {
-            self.attach_target(parent, (index, slot));
+        if !stored.has_implicit_target(slot) {
+            for parent in target_links(parents) {
+                self.attach_target(parent, (index, slot));
+            }
         }
         Ok(reference)
     }
@@ -230,19 +238,39 @@ impl Document {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn replace_span(&mut self, reference: &SpanRef, span: Span) -> Result<(), Error> {
-        let (layer, slot) = self.edit_location(reference)?;
-        let parent = self.target_location(span.target())?;
-        let mut cursor = parent;
-        while let Some((target_layer, target_slot)) = cursor {
-            if (target_layer, target_slot) == (layer, slot) {
-                return Err(Error::Cycle(reference.clone()));
-            }
-            cursor = self.layers[target_layer]
-                .target_at(target_slot)
-                .and_then(|(layer, id)| self.span_location_by_id(layer, id));
+        let location @ (layer, slot) = self.edit_location(reference)?;
+        let parents = self.validate_target(span.target())?;
+        let (reachable, order) = self.dependent_order(location);
+        if target_links(parents).any(|parent| reachable.contains(&parent)) {
+            return Err(Error::Cycle(reference.clone()));
         }
-        let resolved =
-            parent.map(|(layer, slot)| RangeSnapshot::new(self.layers[layer].ranges(slot)));
+
+        let resolved = resolve_target_ranges(parents, |loc| self.ranges_at(loc))?;
+        // Work out all range changes before modifying any span. A replacement
+        // can invalidate a downstream Between, or move both of its endpoints.
+        let mut updates = BTreeMap::new();
+        if !order.is_empty() {
+            let replacement = match span.target() {
+                Target::Text(ranges) => ranges.as_slice(),
+                _ => resolved.as_ref().unwrap().as_slice(),
+            };
+            if replacement != self.ranges_at(location) {
+                updates.insert(location, RangeSnapshot::new(replacement));
+                for child in order {
+                    let ranges = resolve_target_ranges(self.targets_at(child), |loc| {
+                        updates
+                            .get(&loc)
+                            .map_or_else(|| self.ranges_at(loc), RangeSnapshot::as_slice)
+                    })?
+                    .unwrap();
+                    if ranges.as_slice() != self.ranges_at(child) {
+                        updates.insert(child, ranges);
+                    }
+                }
+                updates.remove(&location);
+            }
+        }
+
         self.detach_target(layer, slot);
         let stored = &mut self.layers[layer];
         stored.replace_span(
@@ -251,17 +279,13 @@ impl Document {
             span,
             resolved.as_ref().map(RangeSnapshot::as_slice),
         );
-        if let Some(parent) = parent.filter(|_| !stored.has_implicit_target(slot)) {
-            self.attach_target(parent, (layer, slot));
-        }
-        let mut pending = Vec::new();
-        self.extend_dependents(layer, slot, &mut pending);
-        if !pending.is_empty() {
-            let ranges = RangeSnapshot::new(self.layers[layer].ranges(slot));
-            while let Some((layer, slot)) = pending.pop() {
-                self.layers[layer].refresh_ranges(slot, ranges.as_slice());
-                self.extend_dependents(layer, slot, &mut pending);
+        if !stored.has_implicit_target(slot) {
+            for parent in target_links(parents) {
+                self.attach_target(parent, location);
             }
+        }
+        for ((layer, slot), ranges) in updates {
+            self.layers[layer].refresh_ranges(slot, ranges.as_slice());
         }
         Ok(())
     }
@@ -281,13 +305,10 @@ impl Document {
     /// ```
     pub fn remove_span(&mut self, reference: &SpanRef) -> Result<(), Error> {
         let location = self.edit_location(reference)?;
-        self.detach_target(location.0, location.1);
-        let mut pending = vec![location];
-        while let Some((layer, slot)) = pending.pop() {
-            self.extend_dependents(layer, slot, &mut pending);
-            let stored = &mut self.layers[layer];
-            stored.dependents.remove(&slot);
-            stored.remove_span(slot);
+        let (_, mut order) = self.dependent_order(location);
+        for (layer, slot) in order.drain(..).rev().chain(core::iter::once(location)) {
+            self.detach_target(layer, slot);
+            self.layers[layer].remove_span(slot);
         }
         Ok(())
     }
@@ -787,6 +808,9 @@ impl Document {
         }
         let ranges = match span.target() {
             Target::Span(reference) => self.ranges(reference).map(Cow::Borrowed),
+            Target::Between(first, last) => self
+                .source_between_range(first, last)?
+                .map(|range| Cow::Owned(vec![range])),
             Target::Text(ranges) if ranges.len() <= 1 => {
                 if let Some(range) = ranges.first() {
                     self.validate_range(range)?;
@@ -960,6 +984,10 @@ impl Document {
                         Some(ranges) => ranges.to_vec(),
                         None => continue,
                     },
+                    Target::Between(first, last) => match self.source_between_range(first, last)? {
+                        Some(range) => vec![range],
+                        None => continue,
+                    },
                 };
                 let ranges = self.selection_from_ranges(ranges)?.ranges().to_vec();
                 if let Some(passage_span) = crate::passage::PassageSpan::new(
@@ -1016,19 +1044,69 @@ impl Document {
         Ok((layer, slot))
     }
 
-    fn target_location(&self, target: &Target) -> Result<Option<(usize, usize)>, Error> {
+    fn validate_target(&self, target: &Target) -> Result<TargetLocations, Error> {
+        let locate = |reference: &SpanRef| {
+            self.span_location(reference)
+                .ok_or_else(|| Error::UnknownSpan(reference.clone()))
+        };
         match target {
             Target::Text(ranges) => {
                 for range in ranges {
                     self.validate_range(range)?;
                 }
-                Ok(None)
+                Ok([None, None])
             }
-            Target::Span(reference) => self
-                .span_location(reference)
-                .map(Some)
-                .ok_or_else(|| Error::UnknownSpan(reference.clone())),
+            Target::Span(reference) => Ok([Some(locate(reference)?), None]),
+            Target::Between(first, last) => {
+                validate_endpoint_layers(first, last)?;
+                Ok([Some(locate(first)?), Some(locate(last)?)])
+            }
         }
+    }
+
+    fn source_between_range(
+        &self,
+        first: &SpanRef,
+        last: &SpanRef,
+    ) -> Result<Option<Range<u32>>, Error> {
+        let (Some(first_ranges), Some(last_ranges)) = (self.ranges(first), self.ranges(last))
+        else {
+            return Ok(None);
+        };
+        validate_endpoint_layers(first, last)?;
+        between_range(first_ranges, last_ranges).map(Some)
+    }
+
+    fn ranges_at(&self, (layer, slot): Location) -> &[Range<u32>] {
+        self.layers[layer].ranges(slot)
+    }
+
+    fn targets_at(&self, (layer, slot): Location) -> TargetLocations {
+        self.layers[layer]
+            .target_refs(slot)
+            .map(|target| target.map(|(layer, id)| self.span_location_by_id(layer, id).unwrap()))
+    }
+
+    // Reverse DFS postorder visits each reachable dependent after both of its
+    // affected parents. Keep the traversal iterative for deep target chains.
+    fn dependent_order(&self, root: Location) -> (BTreeSet<Location>, Vec<Location>) {
+        let mut visited = BTreeSet::from([root]);
+        let mut order = Vec::new();
+        let mut stack = vec![(root, false)];
+        let mut children = Vec::new();
+        while let Some((location @ (layer, slot), expanded)) = stack.pop() {
+            if expanded {
+                if location != root {
+                    order.push(location);
+                }
+            } else if location == root || visited.insert(location) {
+                stack.push((location, true));
+                self.extend_dependents(layer, slot, &mut children);
+                stack.extend(children.drain(..).map(|child| (child, false)));
+            }
+        }
+        order.reverse();
+        (visited, order)
     }
 
     fn attach_target(&mut self, parent: (usize, usize), child: (usize, usize)) {
@@ -1040,13 +1118,14 @@ impl Document {
     }
 
     fn detach_target(&mut self, layer: usize, slot: usize) {
-        if let Some(reference) = self.layers[layer].explicit_target(slot) {
-            let (parent_layer, parent_slot) = self.span_location(reference).unwrap();
-            let dependents = &mut self.layers[parent_layer].dependents;
-            let children = dependents.get_mut(&parent_slot).unwrap();
-            children.retain(|&dependent| dependent != (layer, slot));
-            if children.is_empty() {
-                dependents.remove(&parent_slot);
+        if !self.layers[layer].has_implicit_target(slot) {
+            for (parent_layer, parent_slot) in target_links(self.targets_at((layer, slot))) {
+                let dependents = &mut self.layers[parent_layer].dependents;
+                let children = dependents.get_mut(&parent_slot).unwrap();
+                children.retain(|&dependent| dependent != (layer, slot));
+                if children.is_empty() {
+                    dependents.remove(&parent_slot);
+                }
             }
         }
     }
@@ -1069,6 +1148,46 @@ impl Document {
     }
 }
 
+type Location = (usize, usize);
+type TargetLocations = [Option<Location>; 2];
+pub(crate) type TargetRefs<'a> = [Option<(&'a str, IdRef<'a>)>; 2];
+
+fn target_links([first, last]: TargetLocations) -> impl Iterator<Item = Location> {
+    first
+        .into_iter()
+        .chain(last.filter(|&last| Some(last) != first))
+}
+
+fn validate_endpoint_layers(first: &SpanRef, last: &SpanRef) -> Result<(), Error> {
+    if first.layer() != last.layer() {
+        return Err(Error::DifferentLayers);
+    }
+    Ok(())
+}
+
+fn between_range(first: &[Range<u32>], last: &[Range<u32>]) -> Result<Range<u32>, Error> {
+    let (Some(start), Some(end)) = (first.first(), last.last()) else {
+        return Err(Error::EmptyEndpoint);
+    };
+    if first.last().unwrap().end > last.first().unwrap().start {
+        return Err(Error::Reversed);
+    }
+    Ok(start.start..end.end)
+}
+
+fn resolve_target_ranges<'a>(
+    parents: TargetLocations,
+    ranges: impl Fn(Location) -> &'a [Range<u32>],
+) -> Result<Option<RangeSnapshot>, Error> {
+    match parents {
+        [Some(first), Some(last)] => Ok(Some(RangeSnapshot::One(between_range(
+            ranges(first),
+            ranges(last),
+        )?))),
+        [Some(parent), None] => Ok(Some(RangeSnapshot::new(ranges(parent)))),
+        [None, _] => Ok(None),
+    }
+}
 // Snapshot a target's ranges before mutating the layer that may own them.
 enum RangeSnapshot {
     Empty,
@@ -1144,7 +1263,7 @@ impl IntoDocument for Document {
     }
 }
 
-/// An annotation that targets one or more text ranges or another span. It can carry an ID and attributes.
+/// An annotation targeting text ranges, another span, or a run of spans. It can carry an ID and attributes.
 /// Unlike a [`Selection`], a span is an annotation that can be stored in a layer, not just a set of text positions.
 #[derive(Clone, Debug)]
 pub struct Span {
@@ -1183,6 +1302,23 @@ impl Span {
         Self::on(reference.layer(), reference.id().clone())
     }
 
+    /// Creates a span from the first endpoint's start through the last endpoint's end.
+    ///
+    /// Both endpoints must be in the same layer and have ranges. The first
+    /// endpoint must end at or before the last one starts.
+    ///
+    /// ```
+    /// use klause::{Span, span_id};
+    /// let highlight = Span::between(span_id("words", 3_u64), span_id("words", 5_u64))
+    ///     .with_attr("color", "yellow");
+    /// ```
+    pub fn between(first: SpanRef, last: SpanRef) -> Self {
+        Self {
+            id: None,
+            target: Target::Between(first, last),
+            attrs: Attributes::default(),
+        }
+    }
     /// Sets the ID of this span.
     ///
     /// # Example
@@ -1345,13 +1481,24 @@ impl<const N: usize> From<[Range<u32>; N]> for Span {
     }
 }
 
-/// What a [`Span`] annotates: document byte ranges or another span.
+/// What a [`Span`] annotates: text ranges, another span, or a run between two spans.
 #[derive(Clone, Debug)]
 pub enum Target {
     Text(Vec<Range<u32>>),
     Span(SpanRef),
+    /// A single range between two endpoints in the same layer, in text order.
+    Between(SpanRef, SpanRef),
 }
 
+impl Target {
+    pub(crate) fn target_refs(&self) -> TargetRefs<'_> {
+        match self {
+            Self::Text(_) => [None, None],
+            Self::Span(reference) => [Some(reference.target_ref()), None],
+            Self::Between(first, last) => [Some(first.target_ref()), Some(last.target_ref())],
+        }
+    }
+}
 /// An integer or string that identifies a span within its layer.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SpanId {
@@ -1379,6 +1526,9 @@ pub struct SpanRef {
 }
 
 impl SpanRef {
+    pub(crate) fn target_ref(&self) -> (&str, IdRef<'_>) {
+        (self.layer(), self.id().into())
+    }
     /// Creates a reference from a layer identifier and a span ID.
     ///
     /// # Example
@@ -1576,13 +1726,24 @@ pub enum Error {
     UnknownSpan(SpanRef),
     DuplicateId(SpanRef),
     Cycle(SpanRef),
+    /// A Between endpoint ends after the other begins.
+    Reversed,
+    /// The endpoints of a Between target are in different layers.
+    DifferentLayers,
+    /// An endpoint of a Between target has no ranges.
+    EmptyEndpoint,
     ReadOnlyLayer(String),
     OutOfRange(Range<u32>),
     NotCharBoundary(u32),
     SplitsCharacter,
     TooLong,
-    NotOne { found: usize },
-    Source { layer: String, error: SourceError },
+    NotOne {
+        found: usize,
+    },
+    Source {
+        layer: String,
+        error: SourceError,
+    },
 }
 
 impl fmt::Display for Error {
@@ -1595,6 +1756,9 @@ impl fmt::Display for Error {
             Self::Cycle(reference) => {
                 write!(f, "span replacement would create a cycle: {reference:?}")
             }
+            Self::Reversed => f.write_str("Between endpoints are reversed or overlap"),
+            Self::DifferentLayers => f.write_str("Between endpoints must be in the same layer"),
+            Self::EmptyEndpoint => f.write_str("Between endpoints must have ranges"),
             Self::ReadOnlyLayer(layer) => write!(f, "layer is read-only: {layer}"),
             Self::OutOfRange(range) => write!(f, "range is outside the document: {range:?}"),
             Self::NotCharBoundary(position) => {

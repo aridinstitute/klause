@@ -213,7 +213,9 @@ fn write_out(doc: &Document) -> DocumentRow {
                         id: span.id().unwrap().clone(),
                         ranges: match span.target() {
                             Target::Text(ranges) => ranges.clone(),
-                            Target::Span(_) => unreachable!("these fixtures target only text"),
+                            Target::Span(_) | Target::Between(..) => {
+                                unreachable!("these fixtures target only text")
+                            }
                         },
                         attrs: attr_rows(span.attrs()),
                     })

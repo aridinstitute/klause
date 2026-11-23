@@ -160,23 +160,30 @@ layer in `doc.layers()`, `layer.id()`, `layer.name()`, `layer.attrs()`, `layer.i
 
 ### Targets
 
-A span targets either text or another span.
+A span targets text, another span, or a run of spans.
 
 ```rust
-use klause::Span;
+use klause::{Span, span_id};
 
 Span::from(0..3)                              // text
 Span::from([61..70, 75..83])                  // several ranges, read as one unit
 Span::from(48..48)                            // a point
 Span::on("words", 1_003_015_003_u64)          // another span, by layer and ID
 Span::on_ref(&span_ref)                       // another span, by SpanRef
+Span::between(span_id("words", 3_u64), span_id("words", 5_u64)) // run of spans
 ```
 
 - `Span::from` takes a range, an array or `Vec` of ranges, or a range returned by `push`. Ranges are sorted, and
   ranges that overlap or meet end to start are merged into one.
 - A span that targets another span follows it: its ranges are always that span's current ranges. Morphology tags
   target word spans this way.
-- A span can only target a span that already exists, so chains of targets never form a cycle.
+- `Span::between` resolves to a single range from the first endpoint's first start to the last endpoint's last end,
+  including any intervening text. Both endpoints must have ranges and belong to the same layer. The first endpoint
+  must end at or before the last one starts; span ID order does not matter.
+- Replacing an endpoint updates its dependents. If the edit would make a dependent's endpoints invalid, the edit is
+  rejected without changing any spans. Removing either endpoint removes the dependent span.
+- Targets must already exist, and replacements that would introduce cycles through any target are rejected.
+  A source span with a missing endpoint is skipped. `SpanFilter::targeting` matches a run through either endpoint.
 - There is no link target. Model a cross-reference as an ordinary span targeting its local origin with a destination
   identifier stored as an attribute, and resolve that destination in application code.
 
@@ -186,6 +193,7 @@ use klause::Target;
 match span.target() {
     Target::Text(ranges) => { /* &[Range<u32>] */ }
     Target::Span(r)      => { doc.span(r); }
+    Target::Between(first, last) => { (doc.span(first), doc.span(last)); }
 }
 
 doc.ranges(&span_ref);        // Option<&[Range<u32>]>: the span's ranges, following targets

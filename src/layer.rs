@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use core::{cell::RefCell, fmt, ops::Range};
 
-use crate::document::{Attributes, IntoValues, Span, SpanId, SpanRef, Target, Value};
+use crate::document::{Attributes, IntoValues, Span, SpanId, SpanRef, Target, TargetRefs, Value};
 use crate::source::SpanSource;
 
 mod storage;
@@ -314,24 +314,27 @@ impl Layer {
         self.targets.is_implicit(slot)
     }
 
-    pub(crate) fn explicit_target(&self, slot: usize) -> Option<&SpanRef> {
-        self.targets.explicit(slot)
-    }
-
-    pub(crate) fn target_at(&self, slot: usize) -> Option<(&str, IdRef<'_>)> {
+    pub(crate) fn target_refs(&self, slot: usize) -> TargetRefs<'_> {
         if self.has_implicit_target(slot) {
-            Some((self.implicit_target_layer().unwrap(), self.id_at(slot)))
+            [
+                Some((self.implicit_target_layer().unwrap(), self.id_at(slot))),
+                None,
+            ]
+        } else if let Some((first, last)) = self.targets.between(slot) {
+            [Some(first.target_ref()), Some(last.target_ref())]
         } else {
-            self.explicit_target(slot)
-                .map(|r| (r.layer(), r.id().into()))
+            [self.targets.explicit(slot).map(SpanRef::target_ref), None]
         }
     }
 
     pub(crate) fn materialize(&self, slot: usize) -> Span {
-        let target = self.target_at(slot).map_or_else(
-            || Target::Text(self.ranges(slot).to_vec()),
-            |(layer, id)| Target::Span(SpanRef::new(layer, SpanId::from(id))),
-        );
+        let target = if let Some((first, last)) = self.targets.between(slot) {
+            Target::Between(first.clone(), last.clone())
+        } else if let Some((layer, id)) = self.target_refs(slot)[0] {
+            Target::Span(SpanRef::new(layer, SpanId::from(id)))
+        } else {
+            Target::Text(self.ranges(slot).to_vec())
+        };
         Span {
             id: Some(self.id_at(slot).into()),
             target,
@@ -392,17 +395,21 @@ impl Layer {
         resolved: Option<&[Range<u32>]>,
         replacing: bool,
     ) {
-        let target = match span.target {
+        let first = self.ids.len() == 0;
+        match span.target {
             Target::Text(ranges) => {
                 self.write_ranges(slot, ranges.into_iter(), replacing);
-                None
+                self.targets.set(slot, id, first, None);
             }
             Target::Span(reference) => {
                 self.write_ranges(slot, resolved.unwrap().iter().cloned(), replacing);
-                Some(reference)
+                self.targets.set(slot, id, first, Some(reference));
             }
-        };
-        self.targets.set(slot, id, self.ids.len() == 0, target);
+            Target::Between(start, end) => {
+                self.write_ranges(slot, resolved.unwrap().iter().cloned(), replacing);
+                self.targets.set_between(slot, id, first, start, end);
+            }
+        }
         self.attributes.set(slot, span.attrs.into_groups());
         self.attribute_index.get_mut().take();
     }

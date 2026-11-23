@@ -220,6 +220,7 @@ pub(super) struct Targets {
     overrides: BTreeMap<u32, Option<NonZeroU32>>,
     references: Vec<SpanRef>,
     reference_codes: BTreeMap<String, BTreeMap<SpanId, NonZeroU32>>,
+    between: BTreeMap<u32, (SpanRef, SpanRef)>,
 }
 
 impl Targets {
@@ -236,7 +237,23 @@ impl Targets {
         Some(&self.references[code.get() as usize - 1])
     }
 
+    pub(super) fn between(&self, slot: usize) -> Option<&(SpanRef, SpanRef)> {
+        self.between.get(&(slot as u32))
+    }
+
+    pub(super) fn set_between(
+        &mut self,
+        slot: usize,
+        id: IdRef<'_>,
+        first: bool,
+        start: SpanRef,
+        end: SpanRef,
+    ) {
+        self.set(slot, id, first, None);
+        self.between.insert(slot as u32, (start, end));
+    }
     pub(super) fn set(&mut self, slot: usize, id: IdRef<'_>, first: bool, target: Option<SpanRef>) {
+        self.between.remove(&(slot as u32));
         if first {
             self.same_id_layer = target
                 .as_ref()
@@ -271,6 +288,7 @@ impl Targets {
         code
     }
     pub(super) fn remove(&mut self, slot: usize) {
+        self.between.remove(&(slot as u32));
         self.overrides.remove(&(slot as u32));
     }
 }

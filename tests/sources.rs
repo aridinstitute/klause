@@ -68,6 +68,28 @@ fn source_spans_can_target_stored_spans_and_missing_targets_are_skipped() {
 }
 
 #[test]
+fn source_between_spans_resolve_and_skip_missing_endpoints() {
+    let (doc, highlights) = with_highlights();
+    let word = |id: u64| span_id("words", id);
+    highlights.save(Span::between(word(3), word(5)).with_id(1_u64));
+    highlights.save(Span::between(word(3), word(99)).with_id(2_u64));
+    highlights.save(Span::between(word(99), word(5)).with_id(3_u64));
+
+    let passage = doc.get_passage(span_id("verses", "GEN 1:1")).unwrap();
+    let spans: Vec<_> = passage.spans_in("highlights").collect();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].text(), ["beginning God created"]);
+    assert!(passage.error("highlights").is_none());
+    for id in [3_u64, 5] {
+        let filter = spans_in("highlights").targeting(spans_in("words").with_id(id));
+        assert_eq!(
+            doc.get_selection(filter).unwrap().ranges(),
+            [at("beginning", 0).start..at("created", 0).end]
+        );
+    }
+}
+
+#[test]
 fn source_layers_are_read_only() {
     let (mut doc, highlights) = with_highlights();
     highlights.save(Span::from(0..2).with_id(1_u64));

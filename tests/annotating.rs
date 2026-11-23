@@ -199,3 +199,121 @@ fn remove_span_cascades_to_spans_that_target_it_in_every_layer() {
         Err(Error::UnknownSpan(reference)) if reference == word
     ));
 }
+
+fn endpoints() -> (Document, SpanRef, SpanRef) {
+    let mut doc = Document::new("run")
+        .with_layer("words")
+        .with_layer("highlights");
+    doc.push("one two  three, four five six").unwrap();
+    let first = doc
+        .add_span("words", Span::from(9..14).with_id(300_u64))
+        .unwrap();
+    let last = doc
+        .add_span("words", Span::from(21..25).with_id(5_u64))
+        .unwrap();
+    (doc, first, last)
+}
+
+#[test]
+fn between_uses_text_order_and_matches_either_endpoint() {
+    use klause::spans_in;
+    let (mut doc, first, last) = endpoints();
+    let highlight = doc
+        .add_span("highlights", Span::between(first.clone(), last.clone()))
+        .unwrap();
+    assert_eq!(doc.ranges(&highlight).unwrap(), &[9..25]);
+    assert!(matches!(doc.span(&highlight).unwrap().target(),
+        Target::Between(a, b) if a == &first && b == &last));
+    for id in [300_u64, 5] {
+        let filter = spans_in("highlights").targeting(spans_in("words").with_id(id));
+        assert_eq!(doc.get_selection(filter).unwrap().ranges(), &[9..25]);
+    }
+    assert_eq!(
+        doc.get_passage(highlight).unwrap().text(),
+        "three, four five"
+    );
+    assert_eq!(
+        doc.find()
+            .with_text("four")
+            .get_spans("highlights")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn between_rejects_invalid_endpoints() {
+    let (mut doc, first, last) = endpoints();
+    assert!(matches!(
+        doc.add_span("highlights", Span::between(last, first.clone())),
+        Err(Error::Reversed)
+    ));
+    let overlap = doc.add_span("words", Span::from(12..16)).unwrap();
+    assert!(matches!(
+        doc.add_span("highlights", Span::between(first.clone(), overlap)),
+        Err(Error::Reversed)
+    ));
+    let other = doc.add_span("highlights", Span::from(21..25)).unwrap();
+    assert!(matches!(
+        doc.add_span("highlights", Span::between(first, other)),
+        Err(Error::DifferentLayers)
+    ));
+}
+
+#[test]
+fn between_updates_from_both_endpoints_and_cascades_through_a_diamond() {
+    let (mut doc, first, last) = endpoints();
+    let start = doc.add_span("words", Span::from(4..7)).unwrap();
+    let highlight = doc
+        .add_span("highlights", Span::between(first.clone(), last.clone()))
+        .unwrap();
+    let alias = doc
+        .add_span("highlights", Span::on_ref(&highlight))
+        .unwrap();
+
+    doc.replace_span(&first, Span::on_ref(&start)).unwrap();
+    doc.replace_span(&last, Span::from([16..20, 21..25]))
+        .unwrap();
+    assert_eq!(doc.ranges(&alias).unwrap(), &[4..25]);
+
+    assert!(matches!(
+        doc.replace_span(&last, Span::from(0..3)),
+        Err(Error::Reversed)
+    ));
+    assert_eq!(doc.ranges(&last).unwrap(), &[16..20, 21..25]);
+    assert_eq!(doc.ranges(&alias).unwrap(), &[4..25]);
+
+    // Both endpoints now depend on the same span. Point endpoints can coincide.
+    doc.replace_span(&start, Span::from(4..4)).unwrap();
+    doc.replace_span(&last, Span::on_ref(&start)).unwrap();
+    doc.replace_span(&start, Span::from(7..7)).unwrap();
+    assert_eq!(doc.ranges(&alias).unwrap(), &[7..7]);
+    doc.remove_span(&start).unwrap();
+    assert!(doc.span(&highlight).is_none());
+    assert!(doc.span(&alias).is_none());
+}
+
+#[test]
+fn between_removing_one_endpoint_detaches_the_other() {
+    let (mut doc, first, last) = endpoints();
+    let highlight = doc
+        .add_span("highlights", Span::between(first.clone(), last.clone()))
+        .unwrap();
+    doc.remove_span(&last).unwrap();
+    assert!(doc.span(&highlight).is_none());
+    let new_span = doc.add_span("highlights", Span::from(0..3)).unwrap();
+    doc.remove_span(&first).unwrap();
+    assert!(doc.span(&new_span).is_some());
+}
+
+#[test]
+fn between_cycle_through_second_endpoint_is_rejected() {
+    let (mut doc, first, last) = endpoints();
+    let between = doc
+        .add_span("highlights", Span::between(first, last.clone()))
+        .unwrap();
+    assert!(
+        matches!(doc.replace_span(&last, Span::on_ref(&between)), Err(Error::Cycle(r)) if r == last)
+    );
+}
