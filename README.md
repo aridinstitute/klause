@@ -25,7 +25,7 @@ Run `cargo add klause`, or add it to `Cargo.toml`:
 
 ```toml
 [dependencies]
-klause = "0.1.0"
+klause = "0.2.0"
 ```
 
 Set `default-features = false` to build Klause with `alloc` and without `std`.
