@@ -271,6 +271,8 @@ single-document Bible workload or its memory target.
 ```sh
 cargo bench --locked --bench bible_workload -- --noplot
 cargo bench --locked --bench bible_workload -- --rss
+cargo bench --bench bible_workload -- overlay_insert_10000
+cargo bench --bench bible_workload -- --overlay-rss
 cargo bench --locked --bench bsb_usj -- 'full_.*phrase' --noplot
 ```
 
@@ -301,6 +303,13 @@ resident memory, not peak memory. It reported **759.7 MB** loaded (before
 indexes), and **947.7 MB** after chapter, verb, and reverse-reference queries,
 against a **400 MB** target. The process started at 2.2 MB. Rows are dropped
 before the loaded snapshot; RSS can still include allocator-retained pages.
+
+`overlay_insert_10000` measures inserting 10,000 two-endpoint spans into an
+editable layer on a cloned, frozen Bible. The fixture, freeze, and clone are
+outside the timed operation. `--overlay-rss` samples current RSS immediately
+before and after insertion and checks that every base layer is still shared.
+The local release run took 3.49 ms (Criterion estimate). The separate RSS
+run went from 341.2 MB to 347.7 MB, with no copied base layers.
 
 ### Folded search vs. verse materialization
 

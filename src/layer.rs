@@ -1,7 +1,13 @@
-use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
-use core::{cell::RefCell, fmt, ops::Range};
+#[cfg(not(feature = "std"))]
+use alloc::collections::BTreeSet;
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use core::{fmt, ops::Range};
+#[cfg(feature = "std")]
+use std::sync::OnceLock;
 
-use crate::document::{Attributes, IntoValues, Span, SpanId, SpanRef, Target, TargetRefs, Value};
+use crate::document::{
+    Attributes, IntoValues, Location, Span, SpanId, SpanRef, Target, TargetRefs, Value,
+};
 use crate::source::SpanSource;
 
 mod storage;
@@ -9,6 +15,7 @@ mod storage;
 pub(crate) use storage::IdRef;
 use storage::{AttributeColumns, Ids, Rows, SpanCache, Targets};
 /// A named collection of spans, optionally populated by a read-only span source.
+#[derive(Clone)]
 pub struct Layer {
     id: String,
     name: String,
@@ -22,17 +29,46 @@ pub struct Layer {
     attributes: AttributeColumns,
     borrowed_spans: SpanCache,
     pub(crate) point_span_count: usize,
-    // Reverse edges for explicit targets only; same-ID edges can be inferred.
-    pub(crate) dependents: BTreeMap<usize, Vec<(usize, usize)>>,
+    // Explicit reverse edges from parent location to slots in this layer.
+    // Same-ID edges can be inferred without storing a row for each span.
+    pub(crate) dependents: BTreeMap<Location, Vec<usize>>,
     free_slots: Vec<usize>,
     slot_count: usize,
-    attribute_index: RefCell<Option<AttributeIndex>>,
-    position_index: RefCell<Option<PositionIndex>>,
-    pub(crate) source: Option<Box<dyn SpanSource>>,
+    #[cfg(feature = "std")]
+    attribute_index: OnceLock<Arc<AttributeIndex>>,
+    #[cfg(not(feature = "std"))]
+    attribute_index: AttributeIndex,
+    #[cfg(feature = "std")]
+    position_index: OnceLock<Arc<PositionIndex>>,
+    #[cfg(not(feature = "std"))]
+    position_index: Option<Arc<PositionIndex>>,
+    // Maintain a sorted position index incrementally without std, rather than
+    // rebuilding a whole interval tree on each write. Freeze compacts it.
+    #[cfg(not(feature = "std"))]
+    editable_positions: BTreeSet<(u32, u32, u32)>,
+    source: Option<Arc<dyn SpanSource>>,
+    frozen: bool,
     attrs: Attributes,
 }
 
-type AttributeIndex = BTreeMap<(u32, u32), Vec<u32>>;
+#[cfg(feature = "std")]
+type AttributeSlots = Vec<u32>;
+#[cfg(not(feature = "std"))]
+type AttributeSlots = BTreeSet<u32>;
+type AttributeIndex = BTreeMap<(u32, u32), AttributeSlots>;
+
+fn insert_attribute_codes(index: &mut AttributeIndex, codes: &[(u32, u32)], slot: usize) {
+    let slot = slot as u32;
+    for &pair in codes {
+        let slots = index.entry(pair).or_default();
+        #[cfg(feature = "std")]
+        if slots.last() != Some(&slot) {
+            slots.push(slot);
+        }
+        #[cfg(not(feature = "std"))]
+        slots.insert(slot);
+    }
+}
 
 struct PositionEntry {
     start: u32,
@@ -95,17 +131,20 @@ impl PositionIndex {
         if entry.start > range.end {
             return;
         }
-        let touches = if include_boundaries {
-            entry.end >= range.start
-        } else if entry.start == entry.end {
-            range.start <= entry.start && entry.start <= range.end
-        } else {
-            range.start < range.end && entry.start < range.end && range.start < entry.end
-        };
-        if touches {
+        if position_matches(entry.start, entry.end, range, include_boundaries) {
             slots.push(entry.slot as usize);
         }
         Self::lookup(&entries[mid + 1..], range, include_boundaries, slots);
+    }
+}
+
+fn position_matches(start: u32, end: u32, range: &Range<u32>, include_boundaries: bool) -> bool {
+    if include_boundaries {
+        end >= range.start
+    } else if start == end {
+        range.start <= start && start <= range.end
+    } else {
+        range.start < range.end && start < range.end && range.start < end
     }
 }
 
@@ -116,6 +155,7 @@ impl fmt::Debug for Layer {
             .field("name", &self.name)
             .field("span_count", &self.span_count())
             .field("source", &self.is_source())
+            .field("frozen", &self.is_frozen())
             .field("attrs", &self.attrs)
             .finish()
     }
@@ -146,9 +186,12 @@ impl Layer {
             dependents: BTreeMap::new(),
             free_slots: Vec::new(),
             slot_count: 0,
-            attribute_index: RefCell::new(None),
-            position_index: RefCell::new(None),
+            attribute_index: Default::default(),
+            position_index: Default::default(),
+            #[cfg(not(feature = "std"))]
+            editable_positions: BTreeSet::new(),
             source: None,
+            frozen: false,
             attrs: Attributes::default(),
         }
     }
@@ -173,7 +216,7 @@ impl Layer {
     /// ```
     pub fn source(id: impl Into<String>, source: impl SpanSource + 'static) -> Self {
         let mut layer = Self::new(id);
-        layer.source = Some(Box::new(source));
+        layer.source = Some(Arc::new(source));
         layer
     }
 
@@ -263,6 +306,31 @@ impl Layer {
     /// ```
     pub fn is_source(&self) -> bool {
         self.source.is_some()
+    }
+
+    /// Returns whether the document has frozen this stored layer.
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
+    }
+
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.is_source() || self.is_frozen()
+    }
+
+    pub(crate) fn freeze(&mut self) {
+        #[cfg(feature = "std")]
+        {
+            self.attribute_index
+                .get_or_init(|| Arc::new(self.build_attribute_index()));
+            self.position_index
+                .get_or_init(|| Arc::new(PositionIndex::build(self)));
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            self.position_index = Some(Arc::new(PositionIndex::build(self)));
+            self.editable_positions.clear();
+        }
+        self.frozen = true;
     }
 
     /// Iterates over the spans stored directly in this layer.
@@ -410,8 +478,15 @@ impl Layer {
                 self.targets.set_between(slot, id, first, start, end);
             }
         }
+        #[cfg(not(feature = "std"))]
+        if replacing {
+            self.remove_attribute_codes(slot);
+        }
         self.attributes.set(slot, span.attrs.into_groups());
-        self.attribute_index.get_mut().take();
+        #[cfg(not(feature = "std"))]
+        insert_attribute_codes(&mut self.attribute_index, self.attributes.codes(slot), slot);
+        #[cfg(feature = "std")]
+        self.attribute_index.take();
     }
 
     pub(crate) fn refresh_ranges(&mut self, slot: usize, ranges: &[Range<u32>]) {
@@ -426,10 +501,20 @@ impl Layer {
     ) {
         if replacing {
             self.point_span_count -= usize::from(self.ranges(slot).iter().any(Range::is_empty));
+            #[cfg(not(feature = "std"))]
+            self.remove_position_entries(slot);
         }
         self.ranges.set(slot, ranges);
         self.point_span_count += usize::from(self.ranges(slot).iter().any(Range::is_empty));
-        self.position_index.get_mut().take();
+        #[cfg(not(feature = "std"))]
+        self.editable_positions.extend(
+            self.ranges
+                .get(slot)
+                .iter()
+                .map(|range| (range.start, range.end, slot as u32)),
+        );
+        #[cfg(feature = "std")]
+        self.position_index.take();
     }
 
     pub(crate) fn remove_span(&mut self, slot: usize) {
@@ -437,10 +522,38 @@ impl Layer {
         self.ids.remove(slot, &mut self.next_id);
         self.targets.remove(slot);
         self.borrowed_spans.remove(slot);
-        self.attribute_index.get_mut().take();
-        self.position_index.get_mut().take();
+        #[cfg(not(feature = "std"))]
+        {
+            self.remove_attribute_codes(slot);
+            self.remove_position_entries(slot);
+        }
+        #[cfg(feature = "std")]
+        {
+            self.attribute_index.take();
+            self.position_index.take();
+        }
         // Leave the packed rows in place for reuse; only live IDs expose them.
         self.free_slots.push(slot);
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn remove_attribute_codes(&mut self, slot: usize) {
+        for pair in self.attributes.codes(slot) {
+            if let Some(slots) = self.attribute_index.get_mut(pair) {
+                slots.remove(&(slot as u32));
+                if slots.is_empty() {
+                    self.attribute_index.remove(pair);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn remove_position_entries(&mut self, slot: usize) {
+        for range in self.ranges.get(slot) {
+            self.editable_positions
+                .remove(&(range.start, range.end, slot as u32));
+        }
     }
 
     pub(crate) fn slots_in_position_order(&self) -> Vec<usize> {
@@ -474,10 +587,28 @@ impl Layer {
         range: &Range<u32>,
         include_boundaries: bool,
     ) -> Vec<usize> {
-        let mut index = self.position_index.borrow_mut();
-        let index = index.get_or_insert_with(|| PositionIndex::build(self));
         let mut slots = Vec::new();
-        PositionIndex::lookup(&index.entries, range, include_boundaries, &mut slots);
+        #[cfg(feature = "std")]
+        let index = Some(
+            self.position_index
+                .get_or_init(|| Arc::new(PositionIndex::build(self))),
+        );
+        #[cfg(not(feature = "std"))]
+        let index = self.position_index.as_ref();
+        if let Some(index) = index {
+            PositionIndex::lookup(&index.entries, range, include_boundaries, &mut slots);
+        }
+        #[cfg(not(feature = "std"))]
+        if index.is_none() {
+            for &(start, end, slot) in self
+                .editable_positions
+                .range(..=(range.end, u32::MAX, u32::MAX))
+            {
+                if position_matches(start, end, range, include_boundaries) {
+                    slots.push(slot as usize);
+                }
+            }
+        }
         slots.sort_unstable();
         slots.dedup();
         slots
@@ -487,14 +618,16 @@ impl Layer {
         let Some(key) = self.attr_key(key) else {
             return 0;
         };
-        let index = self.attribute_index.borrow();
-        let Some(index) = index.as_ref() else {
+        #[cfg(feature = "std")]
+        let Some(index) = self.attribute_index.get() else {
             return self.span_count();
         };
+        #[cfg(not(feature = "std"))]
+        let index = &self.attribute_index;
         self.attributes
             .equal_codes(value)
             .filter_map(|value| index.get(&(key, value)))
-            .map(Vec::len)
+            .map(AttributeSlots::len)
             .sum()
     }
 
@@ -502,19 +635,12 @@ impl Layer {
         let Some(key) = self.attr_key(key) else {
             return Vec::new();
         };
-        let mut index = self.attribute_index.borrow_mut();
-        let index = index.get_or_insert_with(|| {
-            let mut built = AttributeIndex::new();
-            for slot in self.slots() {
-                for &pair in self.attributes.codes(slot) {
-                    let matching = built.entry(pair).or_default();
-                    if matching.last() != Some(&(slot as u32)) {
-                        matching.push(slot as u32);
-                    }
-                }
-            }
-            built
-        });
+        #[cfg(feature = "std")]
+        let index = self
+            .attribute_index
+            .get_or_init(|| Arc::new(self.build_attribute_index()));
+        #[cfg(not(feature = "std"))]
+        let index = &self.attribute_index;
 
         let mut slots = Vec::new();
         for code in self.attributes.equal_codes(value) {
@@ -525,6 +651,15 @@ impl Layer {
         slots.sort_unstable();
         slots.dedup();
         slots
+    }
+
+    #[cfg(feature = "std")]
+    fn build_attribute_index(&self) -> AttributeIndex {
+        let mut index = AttributeIndex::new();
+        for slot in self.slots() {
+            insert_attribute_codes(&mut index, self.attributes.codes(slot), slot);
+        }
+        index
     }
 }
 
@@ -568,6 +703,7 @@ mod tests {
     use super::*;
     use crate::Document;
 
+    #[cfg(feature = "std")]
     #[test]
     fn planning_estimates_reuse_indexes_without_building_them() {
         let mut doc = Document::new("test").with_layer("words");
@@ -579,15 +715,15 @@ mod tests {
         let layer = doc.layer("words").unwrap();
         let verb = Value::from("verb");
         assert_eq!(layer.estimated_matching_count("pos", &verb), 2);
-        assert!(layer.attribute_index.borrow().is_none());
-        assert!(layer.position_index.borrow().is_none());
+        assert!(layer.attribute_index.get().is_none());
+        assert!(layer.position_index.get().is_none());
         assert_eq!(layer.matching_slots("pos", &verb).len(), 1);
         assert_eq!(layer.estimated_matching_count("pos", &verb), 1);
         assert_eq!(
             layer.estimated_matching_count("pos", &Value::from("absent")),
             0
         );
-        assert!(layer.position_index.borrow().is_none());
+        assert!(layer.position_index.get().is_none());
     }
 
     #[test]
@@ -622,45 +758,49 @@ mod tests {
         check(&doc);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn position_index_is_lazy_and_only_invalidated_by_span_edits() {
         let mut doc = Document::new("test").with_layer("words").with_layer("tags");
         doc.push("word").unwrap();
         let word = doc.add_span("words", Span::from(0..4)).unwrap();
         doc.add_span("tags", Span::on_ref(&word)).unwrap();
-        assert!(
-            doc.layer("words")
-                .unwrap()
-                .position_index
-                .borrow()
-                .is_none()
-        );
+        assert!(doc.layer("words").unwrap().position_index.get().is_none());
         doc.find().with_layers(["words"]).get_passage().unwrap();
-        assert!(
-            doc.layer("words")
-                .unwrap()
-                .position_index
-                .borrow()
-                .is_some()
-        );
-        assert!(doc.layer("tags").unwrap().position_index.borrow().is_none());
+        assert!(doc.layer("words").unwrap().position_index.get().is_some());
+        assert!(doc.layer("tags").unwrap().position_index.get().is_none());
         doc.get_passage(..).unwrap();
         doc.push(" more").unwrap();
-        assert!(
-            doc.layer("words")
-                .unwrap()
-                .position_index
-                .borrow()
-                .is_some()
-        );
+        assert!(doc.layer("words").unwrap().position_index.get().is_some());
         doc.replace_span(&word, Span::from(5..9)).unwrap();
-        assert!(
-            doc.layer("words")
-                .unwrap()
-                .position_index
-                .borrow()
-                .is_none()
-        );
-        assert!(doc.layer("tags").unwrap().position_index.borrow().is_none());
+        assert!(doc.layer("words").unwrap().position_index.get().is_none());
+        assert!(doc.layer("tags").unwrap().position_index.get().is_none());
+    }
+
+    #[test]
+    fn freezing_builds_indexes_without_changing_results() {
+        let mut doc = Document::new("test").with_layer("words");
+        doc.push("one two").unwrap();
+        let word = doc
+            .add_span("words", Span::from(0..3).with_attr("pos", "noun"))
+            .unwrap();
+        doc.replace_span(&word, Span::from(4..7).with_attr("pos", "verb"))
+            .unwrap();
+        let doc = doc.freeze_layers();
+        let layer = doc.layer("words").unwrap();
+        #[cfg(feature = "std")]
+        {
+            assert!(layer.position_index.get().is_some());
+            assert!(layer.attribute_index.get().is_some());
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            assert!(layer.position_index.is_some());
+            assert!(layer.editable_positions.is_empty());
+        }
+        assert!(layer.touching_slots(&(0..3)).is_empty());
+        assert_eq!(layer.touching_slots(&(4..7)).len(), 1);
+        assert!(layer.matching_slots("pos", &Value::from("noun")).is_empty());
+        assert_eq!(layer.matching_slots("pos", &Value::from("verb")).len(), 1);
     }
 }

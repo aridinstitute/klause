@@ -90,6 +90,17 @@ fn source_between_spans_resolve_and_skip_missing_endpoints() {
 }
 
 #[test]
+fn snapshots_share_live_sources_even_when_stored_layers_are_frozen() {
+    let (doc, highlights) = with_highlights();
+    let base = doc.freeze_layers();
+    let snapshot = base.clone();
+    assert!(!snapshot.layer("highlights").unwrap().is_frozen());
+    highlights.save(Span::on("words", 5_u64).with_id(1_u64));
+    for doc in [&base, &snapshot] {
+        assert_eq!(doc.find().count_spans("highlights").unwrap(), 1);
+    }
+}
+#[test]
 fn source_layers_are_read_only() {
     let (mut doc, highlights) = with_highlights();
     highlights.save(Span::from(0..2).with_id(1_u64));

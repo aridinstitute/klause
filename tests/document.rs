@@ -3,6 +3,37 @@ use std::ops::Range;
 use klause::{Document, Error, IntoDocument, Layer, Span, SpanId, SpanRef, Target, Value};
 
 #[test]
+fn cloned_documents_support_concurrent_index_and_span_reads() {
+    let mut doc = Document::new("threads").with_layer("words");
+    let word = doc
+        .push_span("words", "hello", |span| span.with_attr("pos", "noun"))
+        .unwrap();
+    let reference = klause::span_id("words", 1_u64);
+    let snapshot = doc.clone();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        for doc in [&doc, &snapshot] {
+            let barrier = &barrier;
+            let reference = &reference;
+            let word = word.clone();
+            scope.spawn(move || {
+                barrier.wait();
+                assert_eq!(
+                    doc.span(reference).unwrap().attr("pos"),
+                    Some(&Value::from("noun"))
+                );
+                assert_eq!(
+                    doc.find()
+                        .count_spans(klause::spans_in("words").with_attr("pos", "noun"))
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(doc.get_passage(word).unwrap().spans_in("words").count(), 1);
+            });
+        }
+    });
+}
+#[test]
 fn pushes_return_byte_ranges_and_keep_earlier_positions() {
     let mut doc = Document::new("GEN");
     assert!(doc.is_empty());

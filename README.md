@@ -70,6 +70,22 @@ let highlight = Span::between(span_id("words", 3_u64), span_id("words", 5_u64))
 
 The span covers both endpoints and all text between them. The endpoints must
 be in the same layer, in text order, and must not overlap.
+
+### Freezing a base document
+
+Freeze the stored layers after import if they won't be edited. Clones share
+the frozen base, and edits to an overlay leave that base untouched:
+
+```rust
+let base = doc.freeze_layers();
+let mut editable = base.clone().with_layer("highlights");
+editable.add_span("highlights", highlight)?;
+let snapshot = editable.clone();
+```
+
+Readers can share a snapshot across threads. Later edits don't change the
+snapshot's stored spans, but source layers still read live application data.
+
 ### Querying multiple documents
 
 ```rust
@@ -107,6 +123,7 @@ cargo test
 cargo check --no-default-features
 cargo bench --bench bible_workload
 cargo bench --bench bible_workload -- --rss
+cargo bench --bench bible_workload -- --overlay-rss
 ```
 
 The [benchmark notes](benches/README.md) cover the full synthetic Bible workload,

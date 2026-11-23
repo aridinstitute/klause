@@ -16,11 +16,11 @@ use crate::selection::{IntoSelection, Selection, SpanFilter, SpanView};
 use crate::source::SourceError;
 
 /// A document's UTF-8 text, metadata, and layers of annotations. Text is append-only so existing byte offsets stay valid.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Document {
     id: String,
     text: Arc<String>,
-    layers: Vec<Layer>,
+    layers: Vec<Arc<Layer>>,
     attrs: Attributes,
 }
 
@@ -114,7 +114,36 @@ impl Document {
         if self.layer(layer.id()).is_some() {
             return Err(Error::DuplicateLayer(layer.id().into()));
         }
-        self.layers.push(layer);
+        self.layers.push(Arc::new(layer));
+        Ok(())
+    }
+
+    /// Freezes all stored layers and builds their query indexes.
+    ///
+    /// Clones of the returned document share these layers. Add a new layer
+    /// for spans that still need to be editable. Source layers stay live.
+    pub fn freeze_layers(mut self) -> Self {
+        for layer in &mut self.layers {
+            if !layer.is_read_only() {
+                Arc::make_mut(layer).freeze();
+            }
+        }
+        self
+    }
+
+    /// Freezes a stored layer and builds its query indexes.
+    ///
+    /// A later edit in another layer cannot remove or change the ranges of
+    /// a frozen dependent. Freezing an already read-only layer is a no-op.
+    pub fn freeze_layer(&mut self, id: &str) -> Result<(), Error> {
+        let layer = self
+            .layers
+            .iter_mut()
+            .find(|layer| layer.id() == id)
+            .ok_or_else(|| Error::UnknownLayer(id.into()))?;
+        if !layer.is_read_only() {
+            Arc::make_mut(layer).freeze();
+        }
         Ok(())
     }
 
@@ -170,7 +199,7 @@ impl Document {
         let stored = self
             .layer(layer)
             .ok_or_else(|| Error::UnknownLayer(layer.into()))?;
-        if stored.is_source() {
+        if stored.is_read_only() {
             return Err(Error::ReadOnlyLayer(layer.into()));
         }
         let start = self.len();
@@ -200,7 +229,7 @@ impl Document {
             .iter()
             .position(|stored| stored.id() == layer)
             .ok_or_else(|| Error::UnknownLayer(layer.into()))?;
-        if self.layers[index].is_source() {
+        if self.layers[index].is_read_only() {
             return Err(Error::ReadOnlyLayer(layer.into()));
         }
         let parents = self.validate_target(span.target())?;
@@ -214,7 +243,7 @@ impl Document {
             return Err(Error::DuplicateId(reference));
         }
         let resolved = resolve_target_ranges(parents, |loc| self.ranges_at(loc))?;
-        let stored = &mut self.layers[index];
+        let stored = Arc::make_mut(&mut self.layers[index]);
         let slot = stored.insert_span(id, span, resolved.as_ref().map(RangeSnapshot::as_slice));
         if !stored.has_implicit_target(slot) {
             for parent in target_links(parents) {
@@ -264,6 +293,9 @@ impl Document {
                     })?
                     .unwrap();
                     if ranges.as_slice() != self.ranges_at(child) {
+                        if self.layers[child.0].is_read_only() {
+                            return Err(Error::ReadOnlyLayer(self.layers[child.0].id().into()));
+                        }
                         updates.insert(child, ranges);
                     }
                 }
@@ -272,7 +304,7 @@ impl Document {
         }
 
         self.detach_target(layer, slot);
-        let stored = &mut self.layers[layer];
+        let stored = Arc::make_mut(&mut self.layers[layer]);
         stored.replace_span(
             slot,
             reference.id(),
@@ -285,7 +317,7 @@ impl Document {
             }
         }
         for ((layer, slot), ranges) in updates {
-            self.layers[layer].refresh_ranges(slot, ranges.as_slice());
+            Arc::make_mut(&mut self.layers[layer]).refresh_ranges(slot, ranges.as_slice());
         }
         Ok(())
     }
@@ -305,10 +337,30 @@ impl Document {
     /// ```
     pub fn remove_span(&mut self, reference: &SpanRef) -> Result<(), Error> {
         let location = self.edit_location(reference)?;
-        let (_, mut order) = self.dependent_order(location);
-        for (layer, slot) in order.drain(..).rev().chain(core::iter::once(location)) {
-            self.detach_target(layer, slot);
-            self.layers[layer].remove_span(slot);
+        let (removed, order) = self.dependent_order(location);
+        for &(layer, _) in &order {
+            if self.layers[layer].is_read_only() {
+                return Err(Error::ReadOnlyLayer(self.layers[layer].id().into()));
+            }
+        }
+        // A parent can have many children in the same layer. Prune each
+        // reverse list once rather than scanning it for every removed child.
+        let mut affected = BTreeSet::new();
+        for (layer, slot) in order.into_iter().rev().chain(core::iter::once(location)) {
+            if !self.layers[layer].has_implicit_target(slot) {
+                affected.extend(
+                    target_links(self.targets_at((layer, slot))).map(|parent| (layer, parent)),
+                );
+            }
+            Arc::make_mut(&mut self.layers[layer]).remove_span(slot);
+        }
+        for (layer, parent) in affected {
+            let dependents = &mut Arc::make_mut(&mut self.layers[layer]).dependents;
+            let children = dependents.get_mut(&parent).unwrap();
+            children.retain(|&slot| !removed.contains(&(layer, slot)));
+            if children.is_empty() {
+                dependents.remove(&parent);
+            }
         }
         Ok(())
     }
@@ -521,7 +573,7 @@ impl Document {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn layer(&self, id: &str) -> Option<&Layer> {
-        self.layers.iter().find(|layer| layer.id() == id)
+        self.layers().find(|layer| layer.id() == id)
     }
 
     /// Iterates over the document's layers.
@@ -539,7 +591,7 @@ impl Document {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn layers(&self) -> impl Iterator<Item = &Layer> {
-        self.layers.iter()
+        self.layers.iter().map(Arc::as_ref)
     }
 
     /// Looks up a span by its layer and ID.
@@ -1035,7 +1087,7 @@ impl Document {
             .iter()
             .position(|layer| layer.id() == reference.layer())
             .ok_or_else(|| Error::UnknownLayer(reference.layer().into()))?;
-        if self.layers[layer].is_source() {
+        if self.layers[layer].is_read_only() {
             return Err(Error::ReadOnlyLayer(reference.layer().into()));
         }
         let slot = self.layers[layer]
@@ -1090,7 +1142,7 @@ impl Document {
     // Reverse DFS postorder visits each reachable dependent after both of its
     // affected parents. Keep the traversal iterative for deep target chains.
     fn dependent_order(&self, root: Location) -> (BTreeSet<Location>, Vec<Location>) {
-        let mut visited = BTreeSet::from([root]);
+        let mut visited = BTreeSet::new();
         let mut order = Vec::new();
         let mut stack = vec![(root, false)];
         let mut children = Vec::new();
@@ -1099,7 +1151,7 @@ impl Document {
                 if location != root {
                     order.push(location);
                 }
-            } else if location == root || visited.insert(location) {
+            } else if visited.insert(location) {
                 stack.push((location, true));
                 self.extend_dependents(layer, slot, &mut children);
                 stack.extend(children.drain(..).map(|child| (child, false)));
@@ -1109,22 +1161,23 @@ impl Document {
         (visited, order)
     }
 
-    fn attach_target(&mut self, parent: (usize, usize), child: (usize, usize)) {
-        self.layers[parent.0]
+    fn attach_target(&mut self, parent: Location, (layer, slot): Location) {
+        Arc::make_mut(&mut self.layers[layer])
             .dependents
-            .entry(parent.1)
+            .entry(parent)
             .or_default()
-            .push(child);
+            .push(slot);
     }
 
     fn detach_target(&mut self, layer: usize, slot: usize) {
         if !self.layers[layer].has_implicit_target(slot) {
-            for (parent_layer, parent_slot) in target_links(self.targets_at((layer, slot))) {
-                let dependents = &mut self.layers[parent_layer].dependents;
-                let children = dependents.get_mut(&parent_slot).unwrap();
-                children.retain(|&dependent| dependent != (layer, slot));
+            let parents = self.targets_at((layer, slot));
+            for parent in target_links(parents) {
+                let dependents = &mut Arc::make_mut(&mut self.layers[layer]).dependents;
+                let children = dependents.get_mut(&parent).unwrap();
+                children.retain(|&child| child != slot);
                 if children.is_empty() {
-                    dependents.remove(&parent_slot);
+                    dependents.remove(&parent);
                 }
             }
         }
@@ -1132,11 +1185,11 @@ impl Document {
 
     fn extend_dependents(&self, layer: usize, slot: usize, pending: &mut Vec<(usize, usize)>) {
         let parent = &self.layers[layer];
-        if let Some(children) = parent.dependents.get(&slot) {
-            pending.extend_from_slice(children);
-        }
         let id = parent.id_at(slot);
         for (index, candidate) in self.layers.iter().enumerate() {
+            if let Some(children) = candidate.dependents.get(&(layer, slot)) {
+                pending.extend(children.iter().map(|&child| (index, child)));
+            }
             if candidate.implicit_target_layer() == Some(parent.id())
                 && let Some(child) = candidate
                     .slot(id)
@@ -1148,7 +1201,7 @@ impl Document {
     }
 }
 
-type Location = (usize, usize);
+pub(crate) type Location = (usize, usize);
 type TargetLocations = [Option<Location>; 2];
 pub(crate) type TargetRefs<'a> = [Option<(&'a str, IdRef<'a>)>; 2];
 
@@ -1726,7 +1779,7 @@ pub enum Error {
     UnknownSpan(SpanRef),
     DuplicateId(SpanRef),
     Cycle(SpanRef),
-    /// A Between endpoint ends after the other begins.
+    /// The first Between endpoint ends after the last endpoint begins.
     Reversed,
     /// The endpoints of a Between target are in different layers.
     DifferentLayers,
@@ -2072,5 +2125,77 @@ mod tests {
         assert_eq!(doc.ranges(&tag_two).unwrap(), [0..2, 7..10]);
         doc.remove_span(&second).unwrap();
         assert_eq!(doc.layer("tags").unwrap().spans().count(), 0);
+    }
+
+    #[test]
+    fn snapshots_share_frozen_layers_across_overlay_edits() {
+        fn assert_snapshot<T: Send + Sync + Clone>() {}
+        assert_snapshot::<Document>();
+
+        let (doc, first, second, tag) = fixture();
+        let base = doc.freeze_layers();
+        let mut doc = base.clone().with_layer("highlights");
+        let highlight = doc
+            .add_span("highlights", Span::between(first.clone(), second.clone()))
+            .unwrap();
+        let alias = doc.add_span("highlights", Span::on_ref(&tag)).unwrap();
+        let snapshot = doc.clone();
+        doc.replace_span(&highlight, Span::from(7..10)).unwrap();
+        doc.remove_span(&alias).unwrap();
+
+        for i in 0..base.layers.len() {
+            assert!(Arc::ptr_eq(&base.layers[i], &doc.layers[i]));
+            assert!(Arc::ptr_eq(&snapshot.layers[i], &doc.layers[i]));
+        }
+        assert!(!Arc::ptr_eq(&snapshot.layers[2], &doc.layers[2]));
+        assert!(base.layer("highlights").is_none());
+        assert_eq!(snapshot.ranges(&highlight).unwrap(), [0..6]);
+        assert_eq!(doc.ranges(&highlight).unwrap(), [7..10]);
+        assert!(snapshot.span(&alias).is_some());
+        assert!(doc.span(&alias).is_none());
+    }
+
+    #[test]
+    fn frozen_layers_reject_edits_and_dependent_cascades_atomically() {
+        let (mut doc, first, _, tag) = fixture();
+        let alias = doc.add_span("words", Span::on_ref(&tag)).unwrap();
+        doc.add_layer("frozen").unwrap();
+        let frozen = doc.add_span("frozen", Span::on_ref(&alias)).unwrap();
+        doc.freeze_layer("frozen").unwrap();
+        assert!(doc.layer("frozen").unwrap().is_frozen());
+        assert!(!doc.layer("words").unwrap().is_frozen());
+        for error in [
+            doc.add_span("frozen", Span::from(2..2)).unwrap_err(),
+            doc.replace_span(&frozen, Span::from(2..2)).unwrap_err(),
+            doc.remove_span(&frozen).unwrap_err(),
+            doc.push_span("frozen", "unused", |span| span).unwrap_err(),
+            doc.replace_span(&first, Span::from(2..2)).unwrap_err(),
+            doc.remove_span(&first).unwrap_err(),
+        ] {
+            assert!(matches!(error, Error::ReadOnlyLayer(id) if id == "frozen"));
+        }
+        assert_eq!(doc.text(), "é abc xyz");
+        for span in [&first, &tag, &alias, &frozen] {
+            assert_eq!(doc.ranges(span).unwrap(), [0..2]);
+        }
+        doc.replace_span(&first, Span::from(0..2).with_attr("status", "ok"))
+            .unwrap();
+        assert_eq!(doc.ranges(&frozen).unwrap(), [0..2]);
+    }
+
+    #[test]
+    fn removing_an_editable_endpoint_leaves_the_snapshot_unchanged() {
+        let (mut doc, first, second, tag) = fixture();
+        let overlay = doc
+            .add_span("tags", Span::between(first.clone(), second.clone()))
+            .unwrap();
+        let snapshot = doc.clone();
+        doc.remove_span(&first).unwrap();
+        assert!(doc.span(&tag).is_none());
+        assert!(doc.span(&overlay).is_none());
+        assert!(doc.span(&second).is_some());
+        assert_eq!(snapshot.ranges(&overlay).unwrap(), [0..6]);
+        assert_eq!(snapshot.ranges(&tag).unwrap(), [0..2]);
+        assert!(snapshot.span(&first).is_some());
     }
 }

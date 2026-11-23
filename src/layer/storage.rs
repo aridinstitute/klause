@@ -1,11 +1,16 @@
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
-use core::{cell::OnceCell, cmp::Ordering, num::NonZeroU32, ops::Range};
+use core::{cmp::Ordering, num::NonZeroU32, ops::Range};
+#[cfg(not(feature = "std"))]
+use spin::Once as CacheCell;
+#[cfg(feature = "std")]
+use std::sync::OnceLock as CacheCell;
 
 use crate::{Span, SpanId, SpanRef, Value};
 
 /// A flat column of variable-length rows. Until a row differs in width from
 /// the first one, its offset is implicit. In particular, one range per span
 /// and zero attributes per span require no offset allocation at all.
+#[derive(Clone)]
 pub(super) struct Rows<T> {
     data: Vec<T>,
     offsets: Vec<u32>,
@@ -101,7 +106,7 @@ impl From<IdRef<'_>> for SpanId {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Ids {
     integers: Vec<u64>,
     // Normally a sorted integer ID's index is its slot. Only out-of-order
@@ -111,6 +116,7 @@ pub(super) struct Ids {
     slot_strings: BTreeMap<usize, Arc<str>>,
 }
 
+#[derive(Clone)]
 struct IndirectIds {
     slots: Vec<u32>,
     integers_by_slot: Vec<u64>,
@@ -212,7 +218,7 @@ impl Ids {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Targets {
     // Parallel annotation layers commonly target the same ID in one other
     // layer. Store that relationship once, and record deviations by slot.
@@ -264,7 +270,7 @@ impl Targets {
             None => self.same_id_layer.is_none(),
             Some(r) => self.implicit_layer() == Some(r.layer()) && IdRef::from(r.id()) == id,
         } {
-            self.remove(slot);
+            self.overrides.remove(&(slot as u32));
         } else {
             let code = target.map(|r| self.intern(r));
             self.overrides.insert(slot as u32, code);
@@ -293,7 +299,7 @@ impl Targets {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct AttributeColumns {
     rows: Rows<(u32, u32)>,
     keys: Vec<String>,
@@ -424,47 +430,67 @@ impl AttributeColumns {
 // these Spans at all. A lazily allocated radix tree keeps pages only for slots
 // read through the borrowed API, without a pointer per stored span or unsafe.
 #[derive(Default)]
-pub(super) struct SpanCache(OnceCell<CacheNode>);
+pub(super) struct SpanCache(CacheCell<CacheNode>);
+
+impl Clone for SpanCache {
+    fn clone(&self) -> Self {
+        // A copy-on-write edit doesn't need to copy materialized spans.
+        Self::default()
+    }
+}
 
 enum CacheNode {
-    Branch(Box<[OnceCell<CacheNode>; 16]>),
-    Leaf(Box<[OnceCell<Span>; 16]>),
+    Branch(Box<[CacheCell<CacheNode>; 16]>),
+    Leaf(Box<[CacheCell<Span>; 16]>),
+}
+
+// The no_std cache also publishes borrowed spans to concurrent readers.
+// Unlike query indexes, these values are built at most once per borrowed slot.
+fn get_or_init<T>(cell: &CacheCell<T>, build: impl FnOnce() -> T) -> &T {
+    #[cfg(feature = "std")]
+    {
+        cell.get_or_init(build)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        cell.call_once(build)
+    }
 }
 
 impl SpanCache {
     pub(super) fn get_or_init(&self, slot: usize, build: impl FnOnce() -> Span) -> &Span {
         let mut node = &self.0;
         for shift in (1..8).rev() {
-            let CacheNode::Branch(children) = node.get_or_init(|| {
-                CacheNode::Branch(Box::new(core::array::from_fn(|_| OnceCell::new())))
+            let CacheNode::Branch(children) = get_or_init(node, || {
+                CacheNode::Branch(Box::new(core::array::from_fn(|_| CacheCell::new())))
             }) else {
                 unreachable!()
             };
             node = &children[(slot >> (shift * 4)) & 15];
         }
-        let CacheNode::Leaf(spans) = node
-            .get_or_init(|| CacheNode::Leaf(Box::new(core::array::from_fn(|_| OnceCell::new()))))
-        else {
+        let CacheNode::Leaf(spans) = get_or_init(node, || {
+            CacheNode::Leaf(Box::new(core::array::from_fn(|_| CacheCell::new())))
+        }) else {
             unreachable!()
         };
-        spans[slot & 15].get_or_init(build)
+        get_or_init(&spans[slot & 15], build)
     }
 
     pub(super) fn remove(&mut self, slot: usize) {
-        fn remove(node: &mut OnceCell<CacheNode>, slot: usize, shift: usize) {
+        fn remove(node: &mut CacheCell<CacheNode>, slot: usize, shift: usize) {
             let empty = match node.get_mut() {
                 Some(CacheNode::Branch(children)) => {
                     remove(&mut children[(slot >> shift) & 15], slot, shift - 4);
                     children.iter().all(|child| child.get().is_none())
                 }
                 Some(CacheNode::Leaf(spans)) => {
-                    spans[slot & 15].take();
+                    spans[slot & 15] = CacheCell::new();
                     spans.iter().all(|span| span.get().is_none())
                 }
                 None => false,
             };
             if empty {
-                node.take();
+                *node = CacheCell::new();
             }
         }
         remove(&mut self.0, slot, 28);
