@@ -1,19 +1,26 @@
-use alloc::{borrow::Cow, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 use core::{fmt, ops::Range};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::layer::Layer;
+use crate::layer::{IdRef, Layer};
 use crate::passage::Passage;
 use crate::query::Query;
-use crate::selection::{IntoSelection, Selection, SpanFilter};
+use crate::selection::{IntoSelection, Selection, SpanFilter, SpanView};
 use crate::source::SourceError;
 
 /// A document's UTF-8 text, metadata, and layers of annotations. Text is append-only so existing byte offsets stay valid.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Document {
     id: String,
     text: Arc<String>,
-    layers: Vec<Layer>,
+    layers: Vec<Arc<Layer>>,
     attrs: Attributes,
 }
 
@@ -107,7 +114,36 @@ impl Document {
         if self.layer(layer.id()).is_some() {
             return Err(Error::DuplicateLayer(layer.id().into()));
         }
-        self.layers.push(layer);
+        self.layers.push(Arc::new(layer));
+        Ok(())
+    }
+
+    /// Freezes all stored layers and builds their query indexes.
+    ///
+    /// Clones of the returned document share these layers. Add a new layer
+    /// for spans that still need to be editable. Source layers stay live.
+    pub fn freeze_layers(mut self) -> Self {
+        for layer in &mut self.layers {
+            if !layer.is_read_only() {
+                Arc::make_mut(layer).freeze();
+            }
+        }
+        self
+    }
+
+    /// Freezes a stored layer and builds its query indexes.
+    ///
+    /// A later edit in another layer cannot remove or change the ranges of
+    /// a frozen dependent. Freezing an already read-only layer is a no-op.
+    pub fn freeze_layer(&mut self, id: &str) -> Result<(), Error> {
+        let layer = self
+            .layers
+            .iter_mut()
+            .find(|layer| layer.id() == id)
+            .ok_or_else(|| Error::UnknownLayer(id.into()))?;
+        if !layer.is_read_only() {
+            Arc::make_mut(layer).freeze();
+        }
         Ok(())
     }
 
@@ -163,7 +199,7 @@ impl Document {
         let stored = self
             .layer(layer)
             .ok_or_else(|| Error::UnknownLayer(layer.into()))?;
-        if stored.is_source() {
+        if stored.is_read_only() {
             return Err(Error::ReadOnlyLayer(layer.into()));
         }
         let start = self.len();
@@ -187,55 +223,32 @@ impl Document {
     /// let verse = doc.add_span("verses", Span::from(range).with_id("GEN 3:15"))?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn add_span(&mut self, layer: &str, mut span: Span) -> Result<SpanRef, Error> {
+    pub fn add_span(&mut self, layer: &str, span: Span) -> Result<SpanRef, Error> {
         let index = self
             .layers
             .iter()
             .position(|stored| stored.id() == layer)
             .ok_or_else(|| Error::UnknownLayer(layer.into()))?;
-        if self.layers[index].is_source() {
+        if self.layers[index].is_read_only() {
             return Err(Error::ReadOnlyLayer(layer.into()));
         }
-        self.validate_target(span.target())?;
-        let parent = match span.target() {
-            Target::Span(reference) => self.span_location(reference),
-            Target::Text(_) => None,
-        };
-        let ranges = match span.target() {
-            Target::Text(ranges) => ranges.clone(),
-            Target::Span(reference) => self.ranges(reference).unwrap().to_vec(),
-        };
-        let stored = &mut self.layers[index];
-        let id = match span.id() {
-            Some(id) => id.clone(),
-            None => SpanId::Int(stored.next_id.expect("integer span IDs exhausted")),
-        };
+        let parents = self.validate_target(span.target())?;
+        let stored = &self.layers[index];
+        let id = span
+            .id
+            .clone()
+            .unwrap_or_else(|| SpanId::Int(stored.next_id.expect("integer span IDs exhausted")));
         let reference = SpanRef::new(layer, id.clone());
-        if stored.span_slots.contains_key(&id) {
+        if stored.slot((&id).into()).is_some() {
             return Err(Error::DuplicateId(reference));
         }
-        if let SpanId::Int(value) = &id {
-            if stored.next_id.is_some_and(|next| *value >= next) {
-                stored.next_id = value.checked_add(1);
+        let resolved = resolve_target_ranges(parents, |loc| self.ranges_at(loc))?;
+        let stored = Arc::make_mut(&mut self.layers[index]);
+        let slot = stored.insert_span(id, span, resolved.as_ref().map(RangeSnapshot::as_slice));
+        if !stored.has_implicit_target(slot) {
+            for parent in target_links(parents) {
+                self.attach_target(parent, (index, slot));
             }
-        }
-        span.id = Some(id.clone());
-        stored.point_span_count += usize::from(ranges.iter().any(Range::is_empty));
-        let slot = if let Some(slot) = stored.free_slots.pop() {
-            stored.spans[slot] = Some(span);
-            stored.resolved_ranges[slot] = ranges;
-            slot
-        } else {
-            let slot = stored.spans.len();
-            stored.spans.push(Some(span));
-            stored.resolved_ranges.push(ranges);
-            slot
-        };
-        stored.span_slots.insert(id, slot);
-        stored.invalidate_attribute_index();
-        stored.invalidate_position_index();
-        if let Some(parent) = parent {
-            self.attach_target(parent, (index, slot));
         }
         Ok(reference)
     }
@@ -253,49 +266,49 @@ impl Document {
     /// doc.replace_span(&verse, Span::from(range).with_attr("book", "Genesis"))?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn replace_span(&mut self, reference: &SpanRef, mut span: Span) -> Result<(), Error> {
-        let (layer, slot) = self.edit_location(reference)?;
-        self.validate_target(span.target())?;
-        let parent = match span.target() {
-            Target::Span(target) => {
-                let mut cursor = target;
-                loop {
-                    if cursor == reference {
-                        return Err(Error::Cycle(reference.clone()));
-                    }
-                    match self.span(cursor).unwrap().target() {
-                        Target::Span(next) => cursor = next,
-                        Target::Text(_) => break,
+    pub fn replace_span(&mut self, reference: &SpanRef, span: Span) -> Result<(), Error> {
+        let location = self.edit_location(reference)?;
+        let parents = self.validate_target(span.target())?;
+        if self.can_stream_cascade() {
+            return self.replace_streaming(location, reference, span, parents);
+        }
+        let (reachable, order) = self.dependent_order(location);
+        if target_links(parents).any(|parent| reachable.contains(&parent)) {
+            return Err(Error::Cycle(reference.clone()));
+        }
+
+        let resolved = resolve_target_ranges(parents, |loc| self.ranges_at(loc))?;
+        // Work out all range changes before modifying any span. A replacement
+        // can invalidate a downstream Between, or move both of its endpoints.
+        let mut updates = BTreeMap::new();
+        if !order.is_empty() {
+            let replacement = match span.target() {
+                Target::Text(ranges) => ranges.as_slice(),
+                _ => resolved.as_ref().unwrap().as_slice(),
+            };
+            if replacement != self.ranges_at(location) {
+                updates.insert(location, RangeSnapshot::new(replacement));
+                for child in order {
+                    let ranges = resolve_target_ranges(self.targets_at(child), |loc| {
+                        updates
+                            .get(&loc)
+                            .map_or_else(|| self.ranges_at(loc), RangeSnapshot::as_slice)
+                    })?
+                    .unwrap();
+                    if ranges.as_slice() != self.ranges_at(child) {
+                        if self.layers[child.0].is_read_only() {
+                            return Err(Error::ReadOnlyLayer(self.layers[child.0].id().into()));
+                        }
+                        updates.insert(child, ranges);
                     }
                 }
-                self.span_location(target)
+                updates.remove(&location);
             }
-            Target::Text(_) => None,
-        };
-        let ranges = match span.target() {
-            Target::Text(ranges) => ranges.clone(),
-            Target::Span(target) => self.ranges(target).unwrap().to_vec(),
-        };
-        self.detach_target(layer, slot);
-        if let Some(parent) = parent {
-            self.attach_target(parent, (layer, slot));
         }
-        span.id = Some(reference.id().clone());
-        self.layers[layer].spans[slot] = Some(span);
-        self.layers[layer].invalidate_attribute_index();
-        let mut pending = vec![(layer, slot)];
-        while let Some((layer, slot)) = pending.pop() {
-            self.layers[layer].point_span_count -= usize::from(
-                self.layers[layer].resolved_ranges[slot]
-                    .iter()
-                    .any(Range::is_empty),
-            );
-            self.layers[layer].point_span_count += usize::from(ranges.iter().any(Range::is_empty));
-            self.layers[layer].resolved_ranges[slot].clone_from(&ranges);
-            self.layers[layer].invalidate_position_index();
-            if let Some(dependents) = self.layers[layer].dependents.get(slot) {
-                pending.extend_from_slice(dependents);
-            }
+
+        self.write_replacement(location, reference, span, parents, resolved.as_ref());
+        for ((layer, slot), ranges) in updates {
+            Arc::make_mut(&mut self.layers[layer]).refresh_ranges(slot, ranges.as_slice());
         }
         Ok(())
     }
@@ -315,34 +328,38 @@ impl Document {
     /// ```
     pub fn remove_span(&mut self, reference: &SpanRef) -> Result<(), Error> {
         let location = self.edit_location(reference)?;
-        self.detach_target(location.0, location.1);
-        let mut pending = vec![location];
-        while let Some((layer, slot)) = pending.pop() {
-            let stored = &mut self.layers[layer];
-            if let Some(dependents) = stored.dependents.get_mut(slot) {
-                pending.append(dependents);
+        if self.can_stream_cascade() {
+            self.remove_streaming(location);
+            return Ok(());
+        }
+        let (removed, order) = self.dependent_order(location);
+        for &(layer, _) in &order {
+            if self.layers[layer].is_read_only() {
+                return Err(Error::ReadOnlyLayer(self.layers[layer].id().into()));
             }
-            let span = stored.spans[slot].take().unwrap();
-            let id = span.id().unwrap();
-            stored.span_slots.remove(id);
-            stored.invalidate_attribute_index();
-            stored.invalidate_position_index();
-            if let SpanId::Int(value) = id {
-                if value.checked_add(1) == stored.next_id {
-                    stored.next_id = match stored
-                        .span_slots
-                        .range(..SpanId::Str(String::new()))
-                        .next_back()
-                    {
-                        Some((SpanId::Int(max), _)) => max.checked_add(1),
-                        _ => Some(1),
-                    };
-                }
+        }
+        // A parent can have many children in the same layer. Prune each
+        // reverse list once rather than scanning it for every removed child.
+        let mut affected = BTreeSet::new();
+        for (layer, slot) in order.into_iter().rev().chain(core::iter::once(location)) {
+            if !self.layers[layer].has_implicit_target(slot) {
+                affected.extend(
+                    target_links(self.targets_at((layer, slot))).map(|parent| (layer, parent)),
+                );
             }
-            stored.point_span_count -=
-                usize::from(stored.resolved_ranges[slot].iter().any(Range::is_empty));
-            stored.resolved_ranges[slot].clear();
-            stored.free_slots.push(slot);
+            Arc::make_mut(&mut self.layers[layer]).remove_span(slot);
+        }
+        for (layer, parent) in affected {
+            let dependents = &mut Arc::make_mut(&mut self.layers[layer]).dependents;
+            if removed.contains(&parent) {
+                dependents.remove(&parent);
+                continue;
+            }
+            let children = dependents.get_mut(&parent).unwrap();
+            children.retain(|&slot| !removed.contains(&(layer, slot)));
+            if children.is_empty() {
+                dependents.remove(&parent);
+            }
         }
         Ok(())
     }
@@ -555,7 +572,7 @@ impl Document {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn layer(&self, id: &str) -> Option<&Layer> {
-        self.layers.iter().find(|layer| layer.id() == id)
+        self.layers().find(|layer| layer.id() == id)
     }
 
     /// Iterates over the document's layers.
@@ -573,7 +590,7 @@ impl Document {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn layers(&self) -> impl Iterator<Item = &Layer> {
-        self.layers.iter()
+        self.layers.iter().map(Arc::as_ref)
     }
 
     /// Looks up a span by its layer and ID.
@@ -592,8 +609,8 @@ impl Document {
     /// ```
     pub fn span(&self, reference: &SpanRef) -> Option<&Span> {
         let layer = self.layer(reference.layer())?;
-        let slot = layer.span_slots.get(reference.id())?;
-        layer.spans.get(*slot)?.as_ref()
+        let slot = layer.slot(reference.id().into())?;
+        Some(layer.borrowed_span(slot))
     }
 
     /// Returns the document byte ranges a span targets, following any span references.
@@ -611,8 +628,8 @@ impl Document {
     /// ```
     pub fn ranges(&self, reference: &SpanRef) -> Option<&[Range<u32>]> {
         let layer = self.layer(reference.layer())?;
-        let slot = layer.span_slots.get(reference.id())?;
-        layer.resolved_ranges.get(*slot).map(Vec::as_slice)
+        let slot = layer.slot(reference.id().into())?;
+        Some(layer.ranges(slot))
     }
 
     pub(crate) fn selection_from_ranges(
@@ -656,7 +673,7 @@ impl Document {
                 } else if let Some((key, value)) = filter.index_hint() {
                     layer.estimated_matching_count(key, value)
                 } else {
-                    layer.span_slots.len()
+                    layer.span_count()
                 };
                 cost.saturating_add(candidates)
             })
@@ -693,7 +710,7 @@ impl Document {
         let mut ranges = Vec::new();
         for index in indices {
             let layer = &self.layers[index];
-            let count = layer.span_slots.len();
+            let count = layer.span_count();
             if count == 0 || hits.is_empty() {
                 continue;
             }
@@ -724,12 +741,11 @@ impl Document {
             } else if let Some((key, value)) = filter.index_hint() {
                 layer.matching_slots(key, value)
             } else {
-                layer.span_slots.values().copied().collect()
+                layer.slots().collect()
             };
             for slot in slots {
-                let span = layer.spans[slot].as_ref().unwrap();
-                if filter.matches(self, span, layer.id()) {
-                    ranges.extend(layer.resolved_ranges[slot].iter().cloned());
+                if filter.matches(self, SpanView::Stored(layer, slot), layer.id()) {
+                    ranges.extend_from_slice(layer.ranges(slot));
                 }
             }
         }
@@ -752,11 +768,9 @@ impl Document {
         for index in self.matching_layer_indices(filter)? {
             let layer = &self.layers[index];
             if full && !filter.has_conditions() && !layer.is_source() {
-                // Vacant slots have no ranges, just like spans with empty targets.
                 count += layer
-                    .resolved_ranges
-                    .iter()
-                    .filter(|r| !r.is_empty())
+                    .slots()
+                    .filter(|&slot| !layer.ranges(slot).is_empty())
                     .count();
             } else {
                 self.visit_matching_layer_ranges(layer, filter, |ranges| {
@@ -799,8 +813,8 @@ impl Document {
             return Ok(());
         }
         if !filter.has_conditions() {
-            // Empty targets and cleared slots never contribute a range.
-            for ranges in &layer.resolved_ranges {
+            for slot in layer.slots() {
+                let ranges = layer.ranges(slot);
                 if !ranges.is_empty() {
                     visit(ranges);
                 }
@@ -808,9 +822,8 @@ impl Document {
             return Ok(());
         }
         let visit_slot = |slot: usize| {
-            let span = layer.spans[slot].as_ref().unwrap();
-            if filter.matches(self, span, layer.id()) {
-                visit(&layer.resolved_ranges[slot]);
+            if filter.matches(self, SpanView::Stored(layer, slot), layer.id()) {
+                visit(layer.ranges(slot));
             }
         };
         if let Some((key, value)) = filter.index_hint() {
@@ -819,7 +832,7 @@ impl Document {
                 .into_iter()
                 .for_each(visit_slot);
         } else {
-            layer.span_slots.values().copied().for_each(visit_slot);
+            layer.slots().for_each(visit_slot);
         }
         Ok(())
     }
@@ -841,11 +854,14 @@ impl Document {
         filter: &SpanFilter,
         span: &'a Span,
     ) -> Result<Option<Cow<'a, [Range<u32>]>>, Error> {
-        if !filter.matches(self, span, layer.id()) || span.id().is_none() {
+        if !filter.matches(self, SpanView::Borrowed(span), layer.id()) || span.id().is_none() {
             return Ok(None);
         }
         let ranges = match span.target() {
             Target::Span(reference) => self.ranges(reference).map(Cow::Borrowed),
+            Target::Between(first, last) => self
+                .source_between_range(first, last)?
+                .map(|range| Cow::Owned(vec![range])),
             Target::Text(ranges) if ranges.len() <= 1 => {
                 if let Some(range) = ranges.first() {
                     self.validate_range(range)?;
@@ -875,13 +891,19 @@ impl Document {
         }
     }
 
-    pub(crate) fn matching_spans(&self, filter: &SpanFilter) -> Result<Vec<MatchedSpan>, Error> {
+    pub(crate) fn matching_spans_touching(
+        &self,
+        filter: &SpanFilter,
+        hits: &Selection,
+    ) -> Result<Vec<MatchedSpan>, Error> {
         let mut matches = Vec::new();
         for layer_index in self.matching_layer_indices(filter)? {
             let layer = &self.layers[layer_index];
             if layer.is_source() {
                 for span in self.read_source_spans(layer, filter)? {
-                    if let Some(ranges) = self.matching_source_ranges(layer, filter, &span)? {
+                    if let Some(ranges) = self.matching_source_ranges(layer, filter, &span)?
+                        && span_ranges_touch(&ranges, hits)
+                    {
                         let ranges = ranges.into_owned();
                         matches.push(MatchedSpan {
                             layer_index,
@@ -893,12 +915,14 @@ impl Document {
                 continue;
             }
             let mut push_slot = |slot: usize| {
-                let span = layer.spans[slot].as_ref().unwrap();
-                if filter.matches(self, span, layer.id()) {
+                if (!filter.has_conditions()
+                    || filter.matches(self, SpanView::Stored(layer, slot), layer.id()))
+                    && span_ranges_touch(layer.ranges(slot), hits)
+                {
                     matches.push(MatchedSpan {
                         layer_index,
-                        span: span.clone(),
-                        ranges: layer.resolved_ranges[slot].clone(),
+                        span: layer.materialize(slot),
+                        ranges: layer.ranges(slot).to_vec(),
                     });
                 }
             };
@@ -907,6 +931,10 @@ impl Document {
                     .matching_slots(key, value)
                     .into_iter()
                     .for_each(push_slot);
+            } else if !filter.has_conditions() {
+                // Final results are sorted by start. An ID-ordered scan keeps
+                // the same tie order without sorting spans that won't be read.
+                layer.slots().for_each(push_slot);
             } else {
                 // Preserve ordering for materialized spans with tied starts.
                 for slot in layer.slots_in_position_order() {
@@ -917,14 +945,13 @@ impl Document {
         Ok(matches)
     }
 
-    // Visit borrowed stored spans for aggregation, in the same order as
-    // matching_spans without conditions. Source spans still use the usual
-    // filter pushdown, validation, and error handling.
+    // Visit stored span views for aggregation in position/ID order. Source
+    // spans still use the usual filter pushdown, validation, and error handling.
     pub(crate) fn visit_layer_spans_touching(
         &self,
         layer_id: &str,
         hits: &Selection,
-        mut visit: impl FnMut(&Span),
+        mut visit: impl FnMut(SpanView<'_>),
     ) -> Result<(), Error> {
         let layer = self
             .layer(layer_id)
@@ -932,16 +959,16 @@ impl Document {
         if layer.is_source() {
             let filter = crate::spans_in(layer_id);
             for span in self.read_source_spans(layer, &filter)? {
-                if let Some(ranges) = self.matching_source_ranges(layer, &filter, &span)? {
-                    if span_ranges_touch(&ranges, hits) {
-                        visit(&span);
-                    }
+                if let Some(ranges) = self.matching_source_ranges(layer, &filter, &span)?
+                    && span_ranges_touch(&ranges, hits)
+                {
+                    visit(SpanView::Borrowed(&span));
                 }
             }
         } else {
             for slot in layer.slots_in_position_order() {
-                if span_ranges_touch(&layer.resolved_ranges[slot], hits) {
-                    visit(layer.spans[slot].as_ref().unwrap());
+                if span_ranges_touch(layer.ranges(slot), hits) {
+                    visit(SpanView::Stored(layer, slot));
                 }
             }
         }
@@ -985,8 +1012,8 @@ impl Document {
                         self.text.clone(),
                         range.clone(),
                         layer.id().into(),
-                        layer.spans[slot].as_ref().unwrap().clone(),
-                        &layer.resolved_ranges[slot],
+                        layer.materialize(slot),
+                        layer.ranges(slot),
                     ) {
                         layer_passage_spans.push(passage_span);
                     }
@@ -1006,6 +1033,10 @@ impl Document {
                     Target::Text(ranges) => ranges.clone(),
                     Target::Span(reference) => match self.ranges(reference) {
                         Some(ranges) => ranges.to_vec(),
+                        None => continue,
+                    },
+                    Target::Between(first, last) => match self.source_between_range(first, last)? {
+                        Some(range) => vec![range],
                         None => continue,
                     },
                 };
@@ -1029,11 +1060,24 @@ impl Document {
     }
 
     fn span_location(&self, reference: &SpanRef) -> Option<(usize, usize)> {
+        self.span_location_by_id(reference.layer(), reference.id().into())
+    }
+
+    pub(crate) fn span_location_by_id(
+        &self,
+        layer_id: &str,
+        id: IdRef<'_>,
+    ) -> Option<(usize, usize)> {
         let layer = self
             .layers
             .iter()
-            .position(|layer| layer.id() == reference.layer())?;
-        Some((layer, *self.layers[layer].span_slots.get(reference.id())?))
+            .position(|layer| layer.id() == layer_id)?;
+        Some((layer, self.layers[layer].slot(id)?))
+    }
+
+    pub(crate) fn span_view(&self, layer_id: &str, id: IdRef<'_>) -> Option<SpanView<'_>> {
+        let (layer, slot) = self.span_location_by_id(layer_id, id)?;
+        Some(SpanView::Stored(&self.layers[layer], slot))
     }
 
     fn edit_location(&self, reference: &SpanRef) -> Result<(usize, usize), Error> {
@@ -1042,56 +1086,283 @@ impl Document {
             .iter()
             .position(|layer| layer.id() == reference.layer())
             .ok_or_else(|| Error::UnknownLayer(reference.layer().into()))?;
-        if self.layers[layer].is_source() {
+        if self.layers[layer].is_read_only() {
             return Err(Error::ReadOnlyLayer(reference.layer().into()));
         }
         let slot = self.layers[layer]
-            .span_slots
-            .get(reference.id())
+            .slot(reference.id().into())
             .ok_or_else(|| Error::UnknownSpan(reference.clone()))?;
-        Ok((layer, *slot))
+        Ok((layer, slot))
     }
 
-    fn validate_target(&self, target: &Target) -> Result<(), Error> {
+    fn validate_target(&self, target: &Target) -> Result<TargetLocations, Error> {
+        let locate = |reference: &SpanRef| {
+            self.span_location(reference)
+                .ok_or_else(|| Error::UnknownSpan(reference.clone()))
+        };
         match target {
             Target::Text(ranges) => {
                 for range in ranges {
-                    if range.start > range.end || range.end > self.len() {
-                        return Err(Error::OutOfRange(range.clone()));
-                    }
-                    for position in [range.start, range.end] {
-                        if !self.text.is_char_boundary(position as usize) {
-                            return Err(Error::NotCharBoundary(position));
-                        }
-                    }
+                    self.validate_range(range)?;
+                }
+                Ok([None, None])
+            }
+            Target::Span(reference) => Ok([Some(locate(reference)?), None]),
+            Target::Between(first, last) => {
+                validate_endpoint_layers(first, last)?;
+                Ok([Some(locate(first)?), Some(locate(last)?)])
+            }
+        }
+    }
+
+    fn source_between_range(
+        &self,
+        first: &SpanRef,
+        last: &SpanRef,
+    ) -> Result<Option<Range<u32>>, Error> {
+        let (Some(first_ranges), Some(last_ranges)) = (self.ranges(first), self.ranges(last))
+        else {
+            return Ok(None);
+        };
+        validate_endpoint_layers(first, last)?;
+        between_range(first_ranges, last_ranges).map(Some)
+    }
+
+    fn ranges_at(&self, (layer, slot): Location) -> &[Range<u32>] {
+        self.layers[layer].ranges(slot)
+    }
+
+    fn targets_at(&self, (layer, slot): Location) -> TargetLocations {
+        self.layers[layer]
+            .target_refs(slot)
+            .map(|target| target.map(|(layer, id)| self.span_location_by_id(layer, id).unwrap()))
+    }
+
+    // With one parent per span, every dependent inherits the edited span's
+    // ranges, and there is only one path from that span to each dependent.
+    // If any layer could need validation, keep the preflight before writing.
+    fn can_stream_cascade(&self) -> bool {
+        self.layers
+            .iter()
+            .all(|layer| !layer.is_frozen() && !layer.has_between_targets())
+    }
+
+    fn write_replacement(
+        &mut self,
+        location @ (layer, slot): Location,
+        reference: &SpanRef,
+        span: Span,
+        parents: TargetLocations,
+        resolved: Option<&RangeSnapshot>,
+    ) {
+        self.detach_target(layer, slot);
+        let stored = Arc::make_mut(&mut self.layers[layer]);
+        stored.replace_span(
+            slot,
+            reference.id(),
+            span,
+            resolved.map(RangeSnapshot::as_slice),
+        );
+        if !stored.has_implicit_target(slot) {
+            for parent in target_links(parents) {
+                self.attach_target(parent, location);
+            }
+        }
+    }
+
+    fn replace_streaming(
+        &mut self,
+        location: Location,
+        reference: &SpanRef,
+        span: Span,
+        parents: TargetLocations,
+    ) -> Result<(), Error> {
+        // The *existing* graph has one parent per span, even if the
+        // replacement introduces the first Between target.
+        for parent in target_links(parents) {
+            let mut cursor = Some(parent);
+            while let Some(target) = cursor {
+                if target == location {
+                    return Err(Error::Cycle(reference.clone()));
+                }
+                cursor = self.targets_at(target)[0];
+            }
+        }
+        let resolved = resolve_target_ranges(parents, |loc| self.ranges_at(loc))?;
+        let replacement = match span.target() {
+            Target::Text(ranges) => ranges.as_slice(),
+            _ => resolved.as_ref().unwrap().as_slice(),
+        };
+        let changed = replacement != self.ranges_at(location);
+        self.write_replacement(location, reference, span, parents, resolved.as_ref());
+
+        if changed {
+            let mut pending = Vec::new();
+            self.extend_dependents(location.0, location.1, &mut pending);
+            if !pending.is_empty() {
+                let ranges = RangeSnapshot::new(self.ranges_at(location));
+                while let Some((layer, slot)) = pending.pop() {
+                    Arc::make_mut(&mut self.layers[layer]).refresh_ranges(slot, ranges.as_slice());
+                    self.extend_dependents(layer, slot, &mut pending);
                 }
             }
-            Target::Span(reference) if self.span(reference).is_none() => {
-                return Err(Error::UnknownSpan(reference.clone()));
-            }
-            Target::Span(_) => {}
         }
         Ok(())
     }
 
-    fn attach_target(&mut self, parent: (usize, usize), child: (usize, usize)) {
-        let dependents = &mut self.layers[parent.0].dependents;
-        if dependents.len() <= parent.1 {
-            dependents.resize_with(parent.1 + 1, Vec::new);
+    fn remove_streaming(&mut self, root: Location) {
+        // Only the root can still have a parent outside the removed subtree.
+        self.detach_target(root.0, root.1);
+        let mut pending = Vec::new();
+        let mut current = Some(root);
+        while let Some(location @ (layer, slot)) = current {
+            for index in 0..self.layers.len() {
+                let parent = &self.layers[layer];
+                let candidate = &self.layers[index];
+                if candidate.implicit_target_layer() == Some(parent.id())
+                    && let Some(child) = candidate.slot(parent.id_at(slot))
+                    && candidate.has_implicit_target(child)
+                {
+                    pending.push((index, child));
+                }
+                if candidate.dependents.contains_key(&location) {
+                    let children = Arc::make_mut(&mut self.layers[index])
+                        .dependents
+                        .remove(&location)
+                        .unwrap();
+                    pending.extend(children.into_iter().map(|child| (index, child)));
+                }
+            }
+            Arc::make_mut(&mut self.layers[layer]).remove_span(slot);
+            current = pending.pop();
         }
-        dependents[parent.1].push(child);
+    }
+    // Reverse DFS postorder visits each reachable dependent after both of its
+    // affected parents. Keep the traversal iterative for deep target chains.
+    fn dependent_order(&self, root: Location) -> (BTreeSet<Location>, Vec<Location>) {
+        let mut visited = BTreeSet::new();
+        let mut order = Vec::new();
+        let mut stack = vec![(root, false)];
+        let mut children = Vec::new();
+        while let Some((location @ (layer, slot), expanded)) = stack.pop() {
+            if expanded {
+                if location != root {
+                    order.push(location);
+                }
+            } else if visited.insert(location) {
+                stack.push((location, true));
+                self.extend_dependents(layer, slot, &mut children);
+                stack.extend(children.drain(..).map(|child| (child, false)));
+            }
+        }
+        order.reverse();
+        (visited, order)
+    }
+
+    fn attach_target(&mut self, parent: Location, (layer, slot): Location) {
+        Arc::make_mut(&mut self.layers[layer])
+            .dependents
+            .entry(parent)
+            .or_default()
+            .push(slot);
     }
 
     fn detach_target(&mut self, layer: usize, slot: usize) {
-        let target = self.layers[layer].spans[slot].as_ref().unwrap().target();
-        if let Target::Span(reference) = target {
-            let (parent_layer, parent_slot) = self.span_location(reference).unwrap();
-            self.layers[parent_layer].dependents[parent_slot]
-                .retain(|&dependent| dependent != (layer, slot));
+        if !self.layers[layer].has_implicit_target(slot) {
+            let parents = self.targets_at((layer, slot));
+            for parent in target_links(parents) {
+                let dependents = &mut Arc::make_mut(&mut self.layers[layer]).dependents;
+                let children = dependents.get_mut(&parent).unwrap();
+                children.retain(|&child| child != slot);
+                if children.is_empty() {
+                    dependents.remove(&parent);
+                }
+            }
+        }
+    }
+
+    fn extend_dependents(&self, layer: usize, slot: usize, pending: &mut Vec<(usize, usize)>) {
+        let parent = &self.layers[layer];
+        let id = parent.id_at(slot);
+        for (index, candidate) in self.layers.iter().enumerate() {
+            if let Some(children) = candidate.dependents.get(&(layer, slot)) {
+                pending.extend(children.iter().map(|&child| (index, child)));
+            }
+            if candidate.implicit_target_layer() == Some(parent.id())
+                && let Some(child) = candidate
+                    .slot(id)
+                    .filter(|&s| candidate.has_implicit_target(s))
+            {
+                pending.push((index, child));
+            }
         }
     }
 }
 
+pub(crate) type Location = (usize, usize);
+type TargetLocations = [Option<Location>; 2];
+pub(crate) type TargetRefs<'a> = [Option<(&'a str, IdRef<'a>)>; 2];
+
+fn target_links([first, last]: TargetLocations) -> impl Iterator<Item = Location> {
+    first
+        .into_iter()
+        .chain(last.filter(|&last| Some(last) != first))
+}
+
+fn validate_endpoint_layers(first: &SpanRef, last: &SpanRef) -> Result<(), Error> {
+    if first.layer() != last.layer() {
+        return Err(Error::DifferentLayers);
+    }
+    Ok(())
+}
+
+fn between_range(first: &[Range<u32>], last: &[Range<u32>]) -> Result<Range<u32>, Error> {
+    let (Some(start), Some(end)) = (first.first(), last.last()) else {
+        return Err(Error::EmptyEndpoint);
+    };
+    if first.last().unwrap().end > last.first().unwrap().start {
+        return Err(Error::Reversed);
+    }
+    Ok(start.start..end.end)
+}
+
+fn resolve_target_ranges<'a>(
+    parents: TargetLocations,
+    ranges: impl Fn(Location) -> &'a [Range<u32>],
+) -> Result<Option<RangeSnapshot>, Error> {
+    match parents {
+        [Some(first), Some(last)] => Ok(Some(RangeSnapshot::One(between_range(
+            ranges(first),
+            ranges(last),
+        )?))),
+        [Some(parent), None] => Ok(Some(RangeSnapshot::new(ranges(parent)))),
+        [None, _] => Ok(None),
+    }
+}
+// Snapshot a target's ranges before mutating the layer that may own them.
+enum RangeSnapshot {
+    Empty,
+    One(Range<u32>),
+    Many(Vec<Range<u32>>),
+}
+
+impl RangeSnapshot {
+    fn new(ranges: &[Range<u32>]) -> Self {
+        match ranges {
+            [] => Self::Empty,
+            [range] => Self::One(range.clone()),
+            ranges => Self::Many(ranges.to_vec()),
+        }
+    }
+
+    fn as_slice(&self) -> &[Range<u32>] {
+        match self {
+            Self::Empty => &[],
+            Self::One(range) => core::slice::from_ref(range),
+            Self::Many(ranges) => ranges,
+        }
+    }
+}
 pub(crate) fn span_ranges_touch(ranges: &[Range<u32>], selection: &Selection) -> bool {
     ranges.iter().any(|span| {
         selection.ranges().iter().any(|hit| {
@@ -1143,13 +1414,13 @@ impl IntoDocument for Document {
     }
 }
 
-/// An annotation that targets one or more text ranges or another span. It can carry an ID and attributes.
+/// An annotation targeting text ranges, another span, or a run of spans. It can carry an ID and attributes.
 /// Unlike a [`Selection`], a span is an annotation that can be stored in a layer, not just a set of text positions.
 #[derive(Clone, Debug)]
 pub struct Span {
-    id: Option<SpanId>,
-    target: Target,
-    attrs: Attributes,
+    pub(crate) id: Option<SpanId>,
+    pub(crate) target: Target,
+    pub(crate) attrs: Attributes,
 }
 
 impl Span {
@@ -1182,6 +1453,23 @@ impl Span {
         Self::on(reference.layer(), reference.id().clone())
     }
 
+    /// Creates a span from the first endpoint's start through the last endpoint's end.
+    ///
+    /// Both endpoints must be in the same layer and have ranges. The first
+    /// endpoint must end at or before the last one starts.
+    ///
+    /// ```
+    /// use klause::{Span, span_id};
+    /// let highlight = Span::between(span_id("words", 3_u64), span_id("words", 5_u64))
+    ///     .with_attr("color", "yellow");
+    /// ```
+    pub fn between(first: SpanRef, last: SpanRef) -> Self {
+        Self {
+            id: None,
+            target: Target::Between(first, last),
+            attrs: Attributes::default(),
+        }
+    }
     /// Sets the ID of this span.
     ///
     /// # Example
@@ -1319,11 +1607,13 @@ impl From<Vec<Range<u32>>> for Span {
         ranges.sort_by_key(|range| (range.start, range.end));
         let mut merged: Vec<Range<u32>> = Vec::with_capacity(ranges.len());
         for range in ranges {
-            if let Some(last) = merged.last_mut() {
-                if last.start <= last.end && range.start <= range.end && range.start <= last.end {
-                    last.end = last.end.max(range.end);
-                    continue;
-                }
+            if let Some(last) = merged.last_mut()
+                && last.start <= last.end
+                && range.start <= range.end
+                && range.start <= last.end
+            {
+                last.end = last.end.max(range.end);
+                continue;
             }
             merged.push(range);
         }
@@ -1342,13 +1632,24 @@ impl<const N: usize> From<[Range<u32>; N]> for Span {
     }
 }
 
-/// What a [`Span`] annotates: document byte ranges or another span.
+/// What a [`Span`] annotates: text ranges, another span, or a run between two spans.
 #[derive(Clone, Debug)]
 pub enum Target {
     Text(Vec<Range<u32>>),
     Span(SpanRef),
+    /// A single range between two endpoints in the same layer, in text order.
+    Between(SpanRef, SpanRef),
 }
 
+impl Target {
+    pub(crate) fn target_refs(&self) -> TargetRefs<'_> {
+        match self {
+            Self::Text(_) => [None, None],
+            Self::Span(reference) => [Some(reference.target_ref()), None],
+            Self::Between(first, last) => [Some(first.target_ref()), Some(last.target_ref())],
+        }
+    }
+}
 /// An integer or string that identifies a span within its layer.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SpanId {
@@ -1376,6 +1677,9 @@ pub struct SpanRef {
 }
 
 impl SpanRef {
+    pub(crate) fn target_ref(&self) -> (&str, IdRef<'_>) {
+        (self.layer(), self.id().into())
+    }
     /// Creates a reference from a layer identifier and a span ID.
     ///
     /// # Example
@@ -1507,6 +1811,23 @@ impl<T: Into<Value>> IntoValues for Vec<T> {
 pub(crate) struct Attributes(Vec<(String, Vec<Value>)>);
 
 impl Attributes {
+    pub(crate) fn into_groups(self) -> Vec<(String, Vec<Value>)> {
+        self.0
+    }
+
+    pub(crate) fn from_pairs<'a>(pairs: impl Iterator<Item = (&'a str, &'a Value)>) -> Self {
+        let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
+        for (key, value) in pairs {
+            // The packed column preserves group order and keeps equal keys adjacent.
+            if let Some((_, values)) = groups.last_mut().filter(|(last, _)| last == key) {
+                values.push(value.clone());
+            } else {
+                groups.push((key.into(), vec![value.clone()]));
+            }
+        }
+        Self(groups)
+    }
+
     pub(crate) fn set(&mut self, key: String, values: impl IntoValues) {
         let values = values.into_values();
         if values.is_empty() {
@@ -1556,13 +1877,24 @@ pub enum Error {
     UnknownSpan(SpanRef),
     DuplicateId(SpanRef),
     Cycle(SpanRef),
+    /// The first Between endpoint ends after the last endpoint begins.
+    Reversed,
+    /// The endpoints of a Between target are in different layers.
+    DifferentLayers,
+    /// An endpoint of a Between target has no ranges.
+    EmptyEndpoint,
     ReadOnlyLayer(String),
     OutOfRange(Range<u32>),
     NotCharBoundary(u32),
     SplitsCharacter,
     TooLong,
-    NotOne { found: usize },
-    Source { layer: String, error: SourceError },
+    NotOne {
+        found: usize,
+    },
+    Source {
+        layer: String,
+        error: SourceError,
+    },
 }
 
 impl fmt::Display for Error {
@@ -1575,6 +1907,9 @@ impl fmt::Display for Error {
             Self::Cycle(reference) => {
                 write!(f, "span replacement would create a cycle: {reference:?}")
             }
+            Self::Reversed => f.write_str("Between endpoints are reversed or overlap"),
+            Self::DifferentLayers => f.write_str("Between endpoints must be in the same layer"),
+            Self::EmptyEndpoint => f.write_str("Between endpoints must have ranges"),
             Self::ReadOnlyLayer(layer) => write!(f, "layer is read-only: {layer}"),
             Self::OutOfRange(range) => write!(f, "range is outside the document: {range:?}"),
             Self::NotCharBoundary(position) => {
@@ -1675,9 +2010,10 @@ mod tests {
         assert_eq!(doc.ranges(&replacement).unwrap(), [3..6]);
         for _ in 0..100 {
             let child = doc.add_span("tags", Span::on_ref(&replacement)).unwrap();
+            assert_eq!(doc.span_location(&child), Some((1, 1)));
             doc.remove_span(&child).unwrap();
         }
-        assert_eq!(doc.layer("tags").unwrap().spans.len(), 2);
+        assert_eq!(doc.span_location(&replacement), Some((1, 0)));
         doc.remove_span(&second).unwrap();
         assert!(doc.span(&replacement).is_none());
         assert_eq!(doc.layer("tags").unwrap().spans().count(), 0);
@@ -1705,7 +2041,7 @@ mod tests {
         let second = doc.add_span("spans", Span::from(0..0)).unwrap();
         assert!(doc.layer("spans").unwrap().dependents.is_empty());
         doc.add_span("spans", Span::on_ref(&second)).unwrap();
-        assert_eq!(doc.layer("spans").unwrap().dependents.len(), 2);
+        assert_eq!(doc.layer("spans").unwrap().dependents.len(), 1);
         doc.remove_span(&first).unwrap();
         doc.replace_span(&second, Span::from(Vec::<Range<u32>>::new()))
             .unwrap();
@@ -1776,5 +2112,232 @@ mod tests {
             &SpanId::Int(2)
         );
         assert_eq!(doc.get_selection(verbs()).unwrap().ranges(), [2..3]);
+    }
+
+    #[test]
+    fn borrowed_reads_survive_other_reads_and_refresh_on_reuse() {
+        let mut doc = Document::new("borrowed").with_layer("words");
+        doc.push("abcdef").unwrap();
+        let late = doc
+            .add_span("words", Span::from(1..2).with_id(90_u64))
+            .unwrap();
+        let named = doc
+            .add_span("words", Span::from(1..2).with_id("named"))
+            .unwrap();
+        let early = doc
+            .add_span("words", Span::from(1..2).with_id(5_u64))
+            .unwrap();
+        let borrowed = doc.span(&late).unwrap();
+        let ids: Vec<_> = doc
+            .layer("words")
+            .unwrap()
+            .spans()
+            .map(|span| span.id().unwrap())
+            .collect();
+        assert_eq!(ids, [early.id(), late.id(), named.id()]);
+        assert!(core::ptr::eq(borrowed, doc.span(&late).unwrap()));
+
+        doc.replace_span(
+            &late,
+            Span::from([0..1, 3..4]).with_attr("form", "replacement"),
+        )
+        .unwrap();
+        let borrowed = doc.span(&late).unwrap();
+        assert_eq!(borrowed.attr("form"), Some(&Value::from("replacement")));
+        assert!(matches!(borrowed.target(), Target::Text(ranges) if ranges == &[0..1, 3..4]));
+
+        doc.remove_span(&late).unwrap();
+        let added = doc.add_span("words", Span::from(5..6)).unwrap();
+        assert_eq!(doc.span_location(&added), Some((0, 0)));
+        assert_eq!(doc.span(&added).unwrap().attrs().count(), 0);
+        assert_eq!(doc.ranges(&added).unwrap(), [5..6]);
+    }
+
+    #[test]
+    fn interning_preserves_attribute_order_and_exact_float_representations() {
+        let mut doc = Document::new("attributes").with_layer("spans");
+        doc.push("ab").unwrap();
+        let nan = f64::from_bits(0x7ff8_0000_0000_0001);
+        let tagged = doc
+            .add_span(
+                "spans",
+                Span::from(0..1)
+                    .with_attr("z", [Value::Int(0), Value::Float(-0.0), Value::Float(nan)])
+                    .with_attr("a", ["dup", "dup"]),
+            )
+            .unwrap();
+        doc.add_span("spans", Span::from(1..2).with_attr("z", 0.0))
+            .unwrap();
+
+        let span = doc.span(&tagged).unwrap();
+        let attrs: Vec<_> = span.attrs().collect();
+        assert_eq!(
+            attrs.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            ["z", "z", "z", "a", "a"]
+        );
+        assert!(
+            matches!(attrs[1].1, Value::Float(value) if value.to_bits() == (-0.0_f64).to_bits())
+        );
+        assert!(matches!(attrs[2].1, Value::Float(value) if value.to_bits() == nan.to_bits()));
+        let with_value = |value| crate::spans_in("spans").with_attr("z", value);
+        assert_eq!(
+            doc.find()
+                .count_spans(with_value(Value::Float(-0.0)))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            doc.find().count_spans(with_value(Value::Int(0))).unwrap(),
+            2
+        );
+        assert_eq!(
+            doc.find()
+                .count_spans(with_value(Value::Float(nan)))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            doc.find()
+                .count_spans(crate::spans_in("spans").with_attr("a", "dup"))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn inferred_and_explicit_edges_survive_mixed_target_edits() {
+        let (mut doc, first, second, tag) = fixture();
+        let tag_two = doc.add_span("tags", Span::on_ref(&second)).unwrap();
+        let via_tag = doc.add_span("tags", Span::on_ref(&tag)).unwrap();
+        assert!(doc.layer("words").unwrap().dependents.is_empty());
+        assert_eq!(doc.layer("tags").unwrap().dependents.len(), 1);
+
+        doc.replace_span(&tag, Span::from(2..2)).unwrap();
+        doc.remove_span(&first).unwrap();
+        assert_eq!(doc.ranges(&via_tag).unwrap(), [2..2]);
+        assert_eq!(doc.ranges(&tag_two).unwrap(), [3..6]);
+        doc.replace_span(&tag, Span::on_ref(&second)).unwrap();
+        doc.replace_span(&second, Span::from([0..2, 7..10]))
+            .unwrap();
+        assert_eq!(doc.ranges(&via_tag).unwrap(), [0..2, 7..10]);
+        assert_eq!(doc.ranges(&tag_two).unwrap(), [0..2, 7..10]);
+        doc.remove_span(&second).unwrap();
+        assert_eq!(doc.layer("tags").unwrap().spans().count(), 0);
+    }
+
+    #[test]
+    fn snapshots_share_frozen_layers_across_overlay_edits() {
+        fn assert_snapshot<T: Send + Sync + Clone>() {}
+        assert_snapshot::<Document>();
+
+        let (doc, first, second, tag) = fixture();
+        let base = doc.freeze_layers();
+        let mut doc = base.clone().with_layer("highlights");
+        let highlight = doc
+            .add_span("highlights", Span::between(first.clone(), second.clone()))
+            .unwrap();
+        let alias = doc.add_span("highlights", Span::on_ref(&tag)).unwrap();
+        let snapshot = doc.clone();
+        doc.replace_span(&highlight, Span::from(7..10)).unwrap();
+        doc.remove_span(&alias).unwrap();
+
+        for i in 0..base.layers.len() {
+            assert!(Arc::ptr_eq(&base.layers[i], &doc.layers[i]));
+            assert!(Arc::ptr_eq(&snapshot.layers[i], &doc.layers[i]));
+        }
+        assert!(!Arc::ptr_eq(&snapshot.layers[2], &doc.layers[2]));
+        assert!(base.layer("highlights").is_none());
+        assert_eq!(snapshot.ranges(&highlight).unwrap(), [0..6]);
+        assert_eq!(doc.ranges(&highlight).unwrap(), [7..10]);
+        assert!(snapshot.span(&alias).is_some());
+        assert!(doc.span(&alias).is_none());
+    }
+
+    #[test]
+    fn frozen_layers_reject_edits_and_dependent_cascades_atomically() {
+        let (mut doc, first, _, tag) = fixture();
+        let alias = doc.add_span("words", Span::on_ref(&tag)).unwrap();
+        doc.add_layer("frozen").unwrap();
+        let frozen = doc.add_span("frozen", Span::on_ref(&alias)).unwrap();
+        doc.freeze_layer("frozen").unwrap();
+        assert!(doc.layer("frozen").unwrap().is_frozen());
+        assert!(!doc.layer("words").unwrap().is_frozen());
+        for error in [
+            doc.add_span("frozen", Span::from(2..2)).unwrap_err(),
+            doc.replace_span(&frozen, Span::from(2..2)).unwrap_err(),
+            doc.remove_span(&frozen).unwrap_err(),
+            doc.push_span("frozen", "unused", |span| span).unwrap_err(),
+            doc.replace_span(&first, Span::from(2..2)).unwrap_err(),
+            doc.remove_span(&first).unwrap_err(),
+        ] {
+            assert!(matches!(error, Error::ReadOnlyLayer(id) if id == "frozen"));
+        }
+        assert_eq!(doc.text(), "é abc xyz");
+        for span in [&first, &tag, &alias, &frozen] {
+            assert_eq!(doc.ranges(span).unwrap(), [0..2]);
+        }
+        doc.replace_span(&first, Span::from(0..2).with_attr("status", "ok"))
+            .unwrap();
+        assert_eq!(doc.ranges(&frozen).unwrap(), [0..2]);
+    }
+
+    #[test]
+    fn removing_an_editable_endpoint_leaves_the_snapshot_unchanged() {
+        let (mut doc, first, second, tag) = fixture();
+        let overlay = doc
+            .add_span("tags", Span::between(first.clone(), second.clone()))
+            .unwrap();
+        let snapshot = doc.clone();
+        doc.remove_span(&first).unwrap();
+        assert!(doc.span(&tag).is_none());
+        assert!(doc.span(&overlay).is_none());
+        assert!(doc.span(&second).is_some());
+        assert_eq!(snapshot.ranges(&overlay).unwrap(), [0..6]);
+        assert_eq!(snapshot.ranges(&tag).unwrap(), [0..2]);
+        assert!(snapshot.span(&first).is_some());
+    }
+
+    #[test]
+    fn single_target_cascades_resume_after_the_last_between_is_removed_or_replaced() {
+        let (mut doc, first, second, tag) = fixture();
+        assert!(doc.can_stream_cascade());
+
+        // The first Between can itself be a replacement, so check both new
+        // endpoints for cycles even if the existing graph has only single targets.
+        let next_tag = doc.add_span("tags", Span::from(3..6)).unwrap();
+        assert!(matches!(
+            doc.replace_span(&next_tag, Span::between(tag.clone(), next_tag.clone())),
+            Err(Error::Cycle(r)) if r == next_tag
+        ));
+        let run = doc
+            .add_span("tags", Span::between(first.clone(), second.clone()))
+            .unwrap();
+        assert!(!doc.can_stream_cascade());
+        doc.remove_span(&run).unwrap();
+        assert!(doc.can_stream_cascade());
+
+        doc.replace_span(&next_tag, Span::between(first.clone(), second))
+            .unwrap();
+        assert!(!doc.can_stream_cascade());
+        doc.replace_span(&next_tag, Span::on_ref(&tag)).unwrap();
+        assert!(doc.can_stream_cascade());
+
+        // The direct cascade must still isolate a shared snapshot and clean
+        // up both the implicit and explicit reverse links when it removes spans.
+        let snapshot = doc.clone();
+        doc.replace_span(&first, Span::from(2..2)).unwrap();
+        assert_eq!(
+            doc.ranges(&next_tag).unwrap(),
+            core::slice::from_ref(&(2..2))
+        );
+        assert_eq!(
+            snapshot.ranges(&next_tag).unwrap(),
+            core::slice::from_ref(&(0..2))
+        );
+        doc.remove_span(&first).unwrap();
+        assert!(doc.span(&tag).is_none());
+        assert!(doc.span(&next_tag).is_none());
+        assert!(doc.layer("tags").unwrap().dependents.is_empty());
+        assert!(snapshot.span(&next_tag).is_some());
     }
 }

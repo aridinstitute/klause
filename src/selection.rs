@@ -4,7 +4,8 @@ use core::{
     ops::{Range, RangeFrom, RangeFull},
 };
 
-use crate::document::{Document, Error, Span, SpanId, SpanRef, Target, Value};
+use crate::document::{Document, Error, Span, SpanId, SpanRef, Value};
+use crate::layer::{IdRef, Layer};
 
 /// A set of text ranges in a document, represented as sorted, non-overlapping byte ranges.
 /// Unlike a [`crate::Span`], a selection describes text positions and has no annotation attributes.
@@ -422,6 +423,48 @@ impl<const N: usize> IntoSelection for [Range<u32>; N] {
     }
 }
 
+// A query can inspect either source spans or packed stored spans without
+// materializing the latter, even when a filter follows a target chain.
+#[derive(Clone, Copy)]
+pub(crate) enum SpanView<'a> {
+    Borrowed(&'a Span),
+    Stored(&'a Layer, usize),
+}
+
+impl<'a> SpanView<'a> {
+    fn id(self) -> Option<IdRef<'a>> {
+        match self {
+            Self::Borrowed(span) => span.id().map(Into::into),
+            Self::Stored(layer, slot) => Some(layer.id_at(slot)),
+        }
+    }
+
+    fn targets(self) -> impl Iterator<Item = (&'a str, IdRef<'a>)> {
+        match self {
+            Self::Borrowed(span) => span.target().target_refs(),
+            Self::Stored(layer, slot) => layer.target_refs(slot),
+        }
+        .into_iter()
+        .flatten()
+    }
+
+    pub(crate) fn values(self, key: &str) -> impl Iterator<Item = &'a Value> {
+        let (borrowed, stored) = match self {
+            Self::Borrowed(span) => (Some(span), None),
+            Self::Stored(layer, slot) => {
+                (None, layer.attr_key(key).map(|code| (layer, slot, code)))
+            }
+        };
+        borrowed
+            .into_iter()
+            .flat_map(move |span| span.values(key))
+            .chain(
+                stored
+                    .into_iter()
+                    .flat_map(|(layer, slot, code)| layer.values(slot, code)),
+            )
+    }
+}
 /// Criteria for matching spans, such as spans in `morph` whose `pos` is `verb`.
 #[derive(Clone)]
 pub struct SpanFilter {
@@ -477,7 +520,7 @@ impl SpanFilter {
             })
     }
 
-    pub(crate) fn matches(&self, doc: &Document, span: &Span, layer_id: &str) -> bool {
+    pub(crate) fn matches(&self, doc: &Document, span: SpanView<'_>, layer_id: &str) -> bool {
         if self
             .layers
             .as_ref()
@@ -490,15 +533,13 @@ impl SpanFilter {
             Condition::WithoutAttr(key, excluded) => {
                 !span.values(key).any(|value| value == excluded)
             }
-            Condition::WithKey(key) => span.attrs().any(|(stored, _)| stored == key),
-            Condition::WithoutKey(key) => !span.attrs().any(|(stored, _)| stored == key),
-            Condition::WithId(id) => span.id() == Some(id),
-            Condition::Targeting(target_filter) => match span.target() {
-                Target::Span(reference) => doc
-                    .span(reference)
-                    .is_some_and(|target| target_filter.matches(doc, target, reference.layer())),
-                Target::Text(_) => false,
-            },
+            Condition::WithKey(key) => span.values(key).next().is_some(),
+            Condition::WithoutKey(key) => span.values(key).next().is_none(),
+            Condition::WithId(id) => span.id() == Some(id.into()),
+            Condition::Targeting(target_filter) => span.targets().any(|(layer, id)| {
+                doc.span_view(layer, id)
+                    .is_some_and(|target| target_filter.matches(doc, target, layer))
+            }),
         })
     }
 }
@@ -617,7 +658,8 @@ impl SpanFilter {
         self
     }
 
-    /// Restricts matching to spans whose target matches another filter.
+    /// Restricts matching to spans whose target matches another filter. For a
+    /// [`crate::Target::Between`] target, either endpoint can match.
     ///
     /// # Example
     ///

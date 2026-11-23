@@ -65,6 +65,19 @@ Darwin, 14 logical CPUs, 48 GB RAM. Criterion point estimates:
 
 Removing 100,000 tags and their target: **10.9 ms**.
 
+### Single-target cascade fast path
+
+Apple M4 Pro, release build, 10 samples with a 1-second warmup and a 3-second
+measurement target. These means compare the release branch, the initial
+`Between` and copy-on-write PR, and the same PR with the fast path:
+
+| Operation | Release branch | Initial PR | Fast path |
+| :-- | --: | --: | --: |
+| Replace word and update two dependents (1,000 words) | 92 ns | 263 ns | 103 ns |
+| Replace word and update two dependents (790,000 words) | 124 ns | 310 ns | 134 ns |
+| Remove word and two dependents (1,000 words) | 1.19 µs | 1.35 µs | 1.16 µs |
+| Remove word and 100,000 dependents | 5.15 ms | 13.63 ms | 5.01 ms |
+
 The existing creation suite was also run:
 
 ```sh
@@ -271,6 +284,8 @@ single-document Bible workload or its memory target.
 ```sh
 cargo bench --locked --bench bible_workload -- --noplot
 cargo bench --locked --bench bible_workload -- --rss
+cargo bench --bench bible_workload -- overlay_insert_10000
+cargo bench --bench bible_workload -- --overlay-rss
 cargo bench --locked --bench bsb_usj -- 'full_.*phrase' --noplot
 ```
 
@@ -301,6 +316,13 @@ resident memory, not peak memory. It reported **759.7 MB** loaded (before
 indexes), and **947.7 MB** after chapter, verb, and reverse-reference queries,
 against a **400 MB** target. The process started at 2.2 MB. Rows are dropped
 before the loaded snapshot; RSS can still include allocator-retained pages.
+
+`overlay_insert_10000` measures inserting 10,000 two-endpoint spans into an
+editable layer on a cloned, frozen Bible. The fixture, freeze, and clone are
+outside the timed operation. `--overlay-rss` samples current RSS immediately
+before and after insertion and checks that every base layer is still shared.
+The local release run took 3.49 ms (Criterion estimate). The separate RSS
+run went from 341.2 MB to 347.7 MB, with no copied base layers.
 
 ### Folded search vs. verse materialization
 
@@ -341,3 +363,26 @@ High-cardinality counts now use a per-query hash map (`BTreeMap` without
 Its 66-document value count was 23.1 ms versus the earlier 22.36 ms.
 Folded search now streams matches with pattern-sized scratch storage and no
 persistent cache. Verse materialization was not changed.
+
+### Compact layer storage
+
+Same synthetic fixture and release settings. The RSS run drops the fixture rows
+before sampling. Timing estimates below are from paired Criterion `--quick`
+runs and indicate direction and scale, not statistical significance.
+
+| Operation | Before | After |
+| :-- | --: | --: |
+| Loaded RSS, before indexes | 765.1 MB | 297.8 MB |
+| RSS after chapter, verb, and reverse-reference queries | 946.3 MB | 349.1 MB |
+| Build through first chapter | 672 ms | 737 ms |
+| Cold chapter passage | 47.3 ms | 19.0 ms |
+| Warm chapter passage | 220 µs | 265 µs |
+| Cold verb selection | 155 ms | 35.3 ms |
+| Warm verb selection | 8.81 ms | 1.59 ms |
+| Strong’s counts | 36.6 ms | 23.3 ms |
+| Warm reverse-reference lookup | 2.34 ms | 232 µs |
+
+A word uses 16 bytes of column data (ID and range); a same-ID morphology span
+uses 32 (ID, resolved range, and two attribute pairs). These figures omit
+dictionary entries, spare vector capacity, auxiliary indexes, and any spans
+materialized for borrowed public reads.

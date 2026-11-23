@@ -1,6 +1,6 @@
 [package]
 name = "klause"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Store, render, and query annotated text in memory."
@@ -20,6 +20,7 @@ default = ["std"]
 std = []
 
 [dependencies]
+spin = { version = "0.10", default-features = false, features = ["once"] }
 unicode-general-category = "1.1"
 unicode-normalization = { version = "0.1", default-features = false }
 
